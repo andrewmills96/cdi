@@ -49,9 +49,10 @@ def total_returns(pvs: np.ndarray, cashflows: np.ndarray, fwds: np.ndarray, a0: 
 
     returns = np.where(np.isfinite(returns), returns, fwds)
 
-    #checks
-    assert returns.shape == (pvs.shape[0], pvs.shape[1])
-    assert not np.isnan(returns).any()
+    if returns.shape != (pvs.shape[0], pvs.shape[1]):
+        raise ValueError(f"Unexpected returns shape {returns.shape}")
+    if np.isnan(returns).any():
+        raise ValueError("NaN values in returns array")
 
     return returns
 
@@ -114,9 +115,9 @@ class Rates:
         # Interpolate
         y = self.interpolate(dates)
 
-        # Calcualte forward rates
-        t = calc_dt(y.index, val_date)
-        acc = np.power(1.0 + y.values, t)
+        # Calculate forward rates
+        t = calc_dt(pd.DatetimeIndex(y.index), val_date)
+        acc = np.power(1.0 + np.asarray(y.values, dtype=float), t)
         dt = np.diff(t)
         fwds = np.empty_like(y.values)
         fwds[0] = y.iloc[0]
@@ -187,7 +188,10 @@ class TransitionMatrix:
             pX_t = pX[:, t, :, np.newaxis]                                      # (n_sim, n_issuers, 1)
 
             # check where pX_t places on cum tmatrix to identify transition
-            res[:, t + 1, :] = np.sum(pX_t > cum, axis=-1).astype(np.int32)      # (n_sim, n_issuers)
+            # clip guards against pX == 1.0 producing an out-of-bounds index
+            res[:, t + 1, :] = np.clip(
+                np.sum(pX_t > cum, axis=-1), 0, self.tmatrix.shape[0] - 1
+            ).astype(np.int32)                                                     # (n_sim, n_issuers)
 
         # convert back to labels
         return self.indices_to_labels(res)                                     # (n_sim, n_years+1, n_issuers)
@@ -438,9 +442,10 @@ class Bonds:
                 raise ValueError("cashflows must have a DatetimeIndex or a 'date' column.")
             cf = cf.set_index(pd.to_datetime(cf[date_col], errors="raise")).drop(columns=date_col)
 
-        # Ensure cashflow columns match ids
-        if not set(cf.columns).issubset(self.ids):
-            raise ValueError("cashflow columns must be a subset of bond ids.")
+        # Ensure cashflow columns contain all bond ids
+        missing_cf = set(self.ids) - set(cf.columns)
+        if missing_cf:
+            raise ValueError(f"cashflows is missing columns for bond ids: {missing_cf}")
 
         # Ensure numeric cashflows
         if not cf.apply(pd.api.types.is_numeric_dtype).all():
@@ -450,9 +455,6 @@ class Bonds:
         self.cashflows = cf[self.ids].sort_index()
 
         # --- Issuers ---
-        # if not isinstance(self.issuers, Issuers):
-        #     raise TypeError("issuers must be an Issuers object.")
-
         missing_issuers = set(self.issuer_ids.values) - set(self.issuers.ids)
         if missing_issuers:
             raise ValueError(f"issuer_ids missing in issuers object: {missing_issuers}")
@@ -472,11 +474,11 @@ class Bonds:
         """Present value of each bond at val_date using current market rates and spreads."""
 
         cfs = self.year_end_cashflows(val_date)
-        dt = calc_dt(cfs.index, val_date)
+        dt = calc_dt(pd.DatetimeIndex(cfs.index), val_date)
 
-        base_yields = rates.interpolate(cfs.index).values                # (T,)
+        base_yields = np.asarray(rates.interpolate(pd.DatetimeIndex(cfs.index)).values, dtype=float)                # (T,)
         current_ratings = self.issuer_ids.map(self.issuers.ratings).reindex(self.ids)
-        spreads = map_spreads(current_ratings.values[np.newaxis, :], spread_map).squeeze(0)  # (n_bonds,)
+        spreads = map_spreads(np.asarray(current_ratings.values)[np.newaxis, :], spread_map).squeeze(0)  # (n_bonds,)
 
         # Discount factors: (T, n_bonds)
         dfs = (1 + base_yields[:, np.newaxis] + spreads[np.newaxis, :]) ** (-dt[:, np.newaxis])
@@ -515,6 +517,7 @@ class Bonds:
         future = dtime_mat > 0                                               # cashflow is after val year
 
         # Create a matrix of (1 + yields)
+        yields = np.asarray(yields, dtype=float)
         yield_mat = (1 + yields)[:, np.newaxis] * np.ones((1, n_years))   # (n_years_cf, n_years)
 
         # Build PV table: (n_unique, n_years, n_bonds)
@@ -579,9 +582,10 @@ class Bonds:
         received_cashflows = cf_slice * not_defaulted                        # (n_sim, n_years, n_bonds)
 
         # Recovery payments: face * recovery, paid in the first default year, only if not matured
+        recoveries = np.asarray(self.recoveries.values, dtype=float)
         recovery_payments = (
             first_default
-            * self.recoveries.values[np.newaxis, np.newaxis, :]
+            * recoveries[np.newaxis, np.newaxis, :]
             * not_matured[np.newaxis, :n_years, :]
         )                                                                     # (n_sim, n_years, n_bonds)
 
@@ -590,9 +594,13 @@ class Bonds:
 
         # 2. Calculate PVs
 
-        yields = rates.interpolate(dates).values                              # (n_years_cf,)
-        dt = calc_dt(dates, val_date)                                         # (n_years_cf,)
+        yields = np.asarray(rates.interpolate(pd.DatetimeIndex(dates)).values, dtype=float)                              # (n_years_cf,)
+        dt = calc_dt(pd.DatetimeIndex(dates), val_date)                                         # (n_years_cf,)
         pvs = self._run_sim_pv(cashflows, bond_transitions, spread_map, yields, dt)
+
+        # Zero out PV for bonds that have defaulted (default is absorbing — PV = 0 from first default year onward)
+        ever_defaulted = np.cumsum(is_defaulted, axis=1) > 0                 # (n_sim, n_years, n_bonds)
+        pvs = pvs * ~ever_defaulted
 
         # Return
         return BondSimulationResult(
@@ -618,7 +626,7 @@ class Liabilities:
         # Store cashflows as series
         self.cashflows = pd.Series(cashflows, index = pd.to_datetime(dates))
 
-    def pv(self, val_date: datetime, rates: Union[Rates, float], shift=0.0, timeline = False, n_years: float = None) -> float:
+    def pv(self, val_date: datetime, rates: Union[Rates, float], shift=0.0, timeline = False, n_years: Optional[float] = None) -> Union[float, np.ndarray]:
         """
         Calculate PV of liabilities for a specified date and discount rate.
         """
@@ -626,25 +634,26 @@ class Liabilities:
         # Get cashflows beyond val date
         cashflows = self.cashflows.loc[self.cashflows.index > val_date]
         dates = cashflows.index
-        dt = calc_dt(dates, val_date)
+        dt = calc_dt(pd.DatetimeIndex(dates), val_date)
 
-        if np.isscalar(rates):
-            net_yield = pd.Series(rates + shift, index=cashflows.index).values
+        if not isinstance(rates, (int, float)):
+            # rates is a Rates object
+            yields_int = rates.interpolate(pd.DatetimeIndex(dates))
+            net_yield = np.asarray(yields_int.values, dtype=float) + shift
         else:
-            yields_int = rates.interpolate(dates)
-            net_yield = (yields_int + shift).values
-
-        df = (1 + net_yield) ** -dt
-        pv = (cashflows * df).sum()
+            # rates is a scalar
+            net_yield = np.full(len(cashflows), float(rates) + shift, dtype=float)
 
         if timeline:
+            cf_values = np.asarray(cashflows.values, dtype=float)
             pv = np.array([
-                    np.sum(cashflows.values[i + 1:, np.newaxis] * ((1 + net_yield[i+1:, np.newaxis])**-(dt[i + 1:, np.newaxis] - dt[i])))
+                    np.sum(cf_values[i + 1:, np.newaxis] * ((1 + net_yield[i+1:, np.newaxis])**-(dt[i + 1:] - dt[i])))
                     for i in range(len(dates))
             ])
             pv = pv[:n_years] if n_years is not None else pv
         else:
-            pv = (cashflows * (1 + net_yield) ** -dt).sum()
+            cf_values = np.asarray(cashflows.values, dtype=float)
+            pv = (cf_values * (1 + net_yield) ** -dt).sum()
 
         return pv
 
@@ -699,7 +708,9 @@ class FoxConfig:
             asset_buffer,
             mortality_buffer,
             fee,
-            performance_cap
+            performance_cap,
+            additional_payment_year: int = 10,
+            performance_payment_year: int = 25
         ):
         self.heubeck_liabilities=heubeck_liabilities
         self.r_gaap=r_gaap
@@ -709,6 +720,8 @@ class FoxConfig:
         self.mortality_buffer=mortality_buffer
         self.fee=fee
         self.performance_cap=performance_cap
+        self.additional_payment_year=additional_payment_year
+        self.performance_payment_year=performance_payment_year
 
     def to_dict(self):
         return {
@@ -719,7 +732,9 @@ class FoxConfig:
             "asset_buffer":self.asset_buffer,
             "mortality_buffer":self.mortality_buffer,
             "fee":self.fee,
-            "performance_cap":self.performance_cap
+            "performance_cap":self.performance_cap,
+            "additional_payment_year":self.additional_payment_year,
+            "performance_payment_year":self.performance_payment_year
         }
 
 
@@ -754,17 +769,18 @@ class CDIMandate_Fox:
         ### Compute liability metrics. ###
         #  These are deterministic so can be calcualted up front
         liab_series = self.liabilities.cashflows.loc[val_date:][:max_years]
-        liab_cashflows  = liab_series.values
+        liab_cashflows = np.asarray(liab_series.values, dtype=float)
         dates  = pd.DatetimeIndex(liab_series.index)
         T = len(dates)
         dt = calc_dt(dates, val_date)
 
         # PV timelines
-        liab_pv_gaap = self.liabilities.pv(val_date, self.config.r_gaap, timeline=True, n_years=max_years)
-        liab_pv_ifrs = self.liabilities.pv(val_date, self.config.r_ifrs, timeline=True, n_years=max_years)
+        liab_pv_gaap = np.asarray(self.liabilities.pv(val_date, self.config.r_gaap, timeline=True, n_years=max_years), dtype=float)
+        liab_pv_ifrs = np.asarray(self.liabilities.pv(val_date, self.config.r_ifrs, timeline=True, n_years=max_years), dtype=float)
 
         # Meltdown liabilities
-        cum_liab_cfs = liab_cashflows.cumsum()
+        liab_cashflows_arr = np.asarray(liab_cashflows, dtype=float)
+        cum_liab_cfs = liab_cashflows_arr.cumsum()
         meltdown_liabs = np.maximum(
             0.0,
             (self.config.heubeck_liabilities - cum_liab_cfs) * self.config.mortality_buffer
@@ -772,13 +788,16 @@ class CDIMandate_Fox:
         )
 
         # Next 2 liabilities
-        full_cfs = self.liabilities.cashflows.loc[val_date:].values
-        next2 = np.zeros(T)
+        full_cfs = np.asarray(self.liabilities.cashflows.loc[val_date:].values, dtype=float)
+        if len(full_cfs) < T + 2:
+            raise ValueError(
+                f"Liability cashflows too short: need at least {T + 2} entries from val_date, got {len(full_cfs)}."
+            )
         next2 = full_cfs[1 : T + 1] + full_cfs[2 : T + 2]
 
         ### Calculate Asset Values ###
         # Price bonds at val_date and calculate expected cashflows
-        bond_prices = self.bonds.pv(val_date, rates, spread_map)
+        bond_prices = self.bonds.pv(pd.Timestamp(val_date), rates, spread_map)
 
         # market value of CDI and CMBP portfolios at val date
         cdi_t0 = (self.cdi_allocation * bond_prices).sum()
@@ -789,9 +808,9 @@ class CDIMandate_Fox:
 
         # Get expected (no default) cashflows for CDI portfolio
         raw_bond_cfs = self.bonds.year_end_cashflows(val_date)
-        exp_cdi_cf = (raw_bond_cfs * self.cdi_allocation).sum(axis=1).values
+        exp_cdi_cf = np.asarray((raw_bond_cfs * self.cdi_allocation).sum(axis=1).values, dtype=float)
         if len(exp_cdi_cf) < T:
-            exp_cdi_cf = np.pad(exp_cdi_cf, (0, T - len(exp_cdi_cf)))
+            exp_cdi_cf = np.pad(exp_cdi_cf, (0, T - len(exp_cdi_cf)), mode='constant')
         else:
             exp_cdi_cf = exp_cdi_cf[:T]
 
@@ -809,8 +828,8 @@ class CDIMandate_Fox:
         cmbp_pvs = allocate_bond_sim(bond_sim, self.cmbp_allocation, shape, 'pvs')
 
         # Calculate annual total returns of CMBP portfolio, which are used for the bund comparator.
-        fwds = rates.calc_fwds(val_date, dates).values
-        yields = rates.interpolate(dates).values
+        fwds = np.asarray(rates.calc_fwds(val_date, dates).values, dtype=float)
+        yields = np.asarray(rates.interpolate(dates).values, dtype=float)
         bt = total_returns(cmbp_pvs, cmbp_cfs, fwds, cmbp_t0)
 
         ### Run asset-liability waterfall ###
@@ -858,16 +877,16 @@ class CDIMandate_Fox:
             assets_t += hgb_pay_t
             cum_hgb_payment += hgb_pay_t
 
-            # Additional payment at year 10 (t == 9) from client if the scheme is underfunded.
+            # Additional payment from client at the configured year if the scheme is underfunded.
             additional_payment_t = 0.0
-            if t == 9:
-                additional_payment_t = np.clip(np.minimum(liab_pv_gaap[t] - assets_t, 1.1 * liab_pv_ifrs[t] - assets_t), 0.0, asset_buffer_arr[t])
+            if t == self.config.additional_payment_year - 1:
+                additional_payment_t = np.clip(np.minimum(np.asarray(liab_pv_gaap, dtype=float)[t] - assets_t, 1.1 * np.asarray(liab_pv_ifrs, dtype=float)[t] - assets_t), 0.0, asset_buffer_arr[t])
                 cash_t += additional_payment_t
                 assets_t += additional_payment_t
 
             # Performance guarantee (bund comparator)
             bund_t = bund_t * (1 + bt[:, t] + self.config.cmbp_margin) - liab_cashflows[t] + additional_payment_t
-            performance_payment = np.clip(bund_t - assets_t, 0.0, self.config.performance_cap)  if t == 24 else 0.0
+            performance_payment = np.clip(bund_t - assets_t, 0.0, self.config.performance_cap) if t == self.config.performance_payment_year - 1 else 0.0
 
             # Net asset return (excl. liability payment and additional injection)
             net_ret_t = (assets_t + liab_cashflows[t] - additional_payment_t) / prev_assets_t - 1.0
