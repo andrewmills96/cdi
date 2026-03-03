@@ -116,13 +116,8 @@ class Rates:
         y = self.interpolate(dates)
 
         # Calculate forward rates
-<<<<<<< HEAD
         t = calc_dt(pd.DatetimeIndex(y.index), val_date)
         acc = np.power(1.0 + np.asarray(y.values, dtype=float), t)
-=======
-        t = calc_dt(y.index, val_date)
-        acc = np.power(1.0 + y.values, t)
->>>>>>> b915299a24f972d1aee59a47871cad61ad35f44d
         dt = np.diff(t)
         fwds = np.empty_like(y.values)
         fwds[0] = y.iloc[0]
@@ -646,13 +641,8 @@ class Liabilities:
             yields_int = rates.interpolate(pd.DatetimeIndex(dates))
             net_yield = np.asarray(yields_int.values, dtype=float) + shift
         else:
-<<<<<<< HEAD
             # rates is a scalar
             net_yield = np.full(len(cashflows), float(rates) + shift, dtype=float)
-=======
-            yields_int = rates.interpolate(dates)
-            net_yield = (yields_int + shift).values
->>>>>>> b915299a24f972d1aee59a47871cad61ad35f44d
 
         if timeline:
             cf_values = np.asarray(cashflows.values, dtype=float)
@@ -798,11 +788,7 @@ class CDIMandate_Fox:
         )
 
         # Next 2 liabilities
-<<<<<<< HEAD
         full_cfs = np.asarray(self.liabilities.cashflows.loc[val_date:].values, dtype=float)
-=======
-        full_cfs = self.liabilities.cashflows.loc[val_date:].values
->>>>>>> b915299a24f972d1aee59a47871cad61ad35f44d
         if len(full_cfs) < T + 2:
             raise ValueError(
                 f"Liability cashflows too short: need at least {T + 2} entries from val_date, got {len(full_cfs)}."
@@ -894,11 +880,7 @@ class CDIMandate_Fox:
             # Additional payment from client at the configured year if the scheme is underfunded.
             additional_payment_t = 0.0
             if t == self.config.additional_payment_year - 1:
-<<<<<<< HEAD
-                additional_payment_t = np.clip(np.minimum(np.asarray(liab_pv_gaap, dtype=float)[t] - assets_t, 1.1 * np.asarray(liab_pv_ifrs, dtype=float)[t] - assets_t), 0.0, asset_buffer_arr[t])
-=======
                 additional_payment_t = np.clip(np.minimum(liab_pv_gaap[t] - assets_t, 1.1 * liab_pv_ifrs[t] - assets_t), 0.0, asset_buffer_arr[t])
->>>>>>> b915299a24f972d1aee59a47871cad61ad35f44d
                 cash_t += additional_payment_t
                 assets_t += additional_payment_t
 
