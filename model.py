@@ -196,6 +196,36 @@ class TransitionMatrix:
         # convert back to labels
         return self.indices_to_labels(res)                                     # (n_sim, n_years+1, n_issuers)
 
+    def transitions_from_state(self, pX: np.ndarray, initial_indices: np.ndarray) -> np.ndarray:
+        """
+        Vectorised ratings migration with per-simulation initial ratings.
+        Used by the ICAAP nested simulation where each outer scenario starts
+        from a different set of migrated ratings.
+
+        Parameters
+        ----------
+        pX : (n_sim, n_years, n_issuers) CDF(N(0,1)) draws
+        initial_indices : (n_sim, n_issuers) int array of starting rating indices
+
+        Returns
+        -------
+        transitions : (n_sim, n_years+1, n_issuers) ratings label array
+        """
+        n_sim, n_years, n_issuers = pX.shape
+
+        res = np.empty((n_sim, n_years + 1, n_issuers), dtype=np.int32)
+        res[:, 0, :] = initial_indices                                           # (n_sim, n_issuers)
+
+        for t in range(n_years):
+            cur   = res[:, t, :]
+            cum   = self.cum_tmatrix[cur]
+            pX_t  = pX[:, t, :, np.newaxis]
+            res[:, t + 1, :] = np.clip(
+                np.sum(pX_t > cum, axis=-1), 0, self.tmatrix.shape[0] - 1
+            ).astype(np.int32)
+
+        return self.indices_to_labels(res)
+
     def fundamental_matrix(self):
         """
         Calculate the fundamental matrix for a transition matrix,
@@ -691,10 +721,209 @@ def allocate_bond_sim(bond_sim: BondSimulationResult, allocation: pd.Series, sha
 
 class CDISimulationResult:
     """Output container for CDI sim."""
-    def __init__(self, config, bond_sim, cdi_sim):
+
+    _DEFAULT_QUANTILES = [0.005, 0.05, 0.25, 0.50, 0.75, 0.95, 0.995]
+
+    def __init__(self, config: "FoxConfig", bond_sim: BondSimulationResult, cdi_sim: pd.DataFrame):
         self.config = config
         self.bond_sim = bond_sim
         self.cdi_sim = cdi_sim
+
+    # ------------------------------------------------------------------
+    #  Core: per-scenario discount factors and PV arrays
+    # ------------------------------------------------------------------
+
+    def _discount_factors(self) -> pd.Series:
+        """
+        Compute discount factors (1+y)^{-t} for every (scenario, date) row
+        using the bund yield curve already stored in cdi_sim.
+        """
+        df = self.cdi_sim
+        return (1 + df["bund_yield"]) ** (-df["dt"])
+
+    def _pv_by_scenario(self, column: str) -> pd.Series:
+        """
+        Discount a cashflow column back to val_date and sum per scenario.
+        Returns a Series indexed by scenario.
+        """
+        return (self.cdi_sim[column] * self._discount_factors()).groupby(self.cdi_sim["scenario"]).sum()
+
+    # ------------------------------------------------------------------
+    #  Obligation PVs
+    # ------------------------------------------------------------------
+
+    def pv_hgb_payments(self) -> pd.Series:
+        """PV of HGB top-up payments per scenario, discounted at bund yields."""
+        return self._pv_by_scenario("hgb_payment").rename("pv_hgb_payment")
+
+    def pv_performance_payments(self) -> pd.Series:
+        """PV of performance guarantee payments per scenario, discounted at bund yields."""
+        return self._pv_by_scenario("performance_payment").rename("pv_performance_payment")
+
+    def pv_total_obligations(self) -> pd.Series:
+        """PV of total contingent obligations (HGB + performance) per scenario."""
+        return (self.pv_hgb_payments() + self.pv_performance_payments()).rename("pv_total_obligations")
+
+    def pv_fees(self) -> pd.Series:
+        """PV of fee income per scenario, discounted at bund yields."""
+        return self._pv_by_scenario("fee").rename("pv_fee")
+
+    def pv_net(self) -> pd.Series:
+        """PV of net position (fees − total obligations) per scenario."""
+        return (self.pv_fees() - self.pv_total_obligations()).rename("pv_net")
+
+    # ------------------------------------------------------------------
+    #  Summary
+    # ------------------------------------------------------------------
+
+    def obligation_metrics(self, quantiles: Optional[List[float]] = None) -> pd.DataFrame:
+        """
+        Central reporting method.  Returns a DataFrame with one row per
+        metric and one column per quantile, plus a 'mean' column.
+
+        Metrics
+        -------
+        pv_hgb_payment          PV of HGB top-up payments
+        pv_performance_payment  PV of performance guarantee payment
+        pv_total_obligations    PV of combined contingent obligations
+        pv_fee                  PV of fee income
+        pv_net                  PV of net position (fees − obligations)
+        prob_hgb_trigger        Fraction of scenarios with any HGB payment
+        prob_perf_trigger       Fraction of scenarios with a performance payment
+        prob_net_negative       Fraction of scenarios where PV(fees) < PV(obligations)
+        """
+        qs = quantiles or self._DEFAULT_QUANTILES
+
+        # Build per-scenario Series
+        pv_hgb  = self.pv_hgb_payments()
+        pv_perf = self.pv_performance_payments()
+        pv_tot  = self.pv_total_obligations()
+        pv_fee  = self.pv_fees()
+        pv_net  = self.pv_net()
+
+        # Combine into a DataFrame (n_sim rows × 5 columns)
+        scenarios = pd.DataFrame({
+            pv_hgb.name:  pv_hgb,
+            pv_perf.name: pv_perf,
+            pv_tot.name:  pv_tot,
+            pv_fee.name:  pv_fee,
+            pv_net.name:  pv_net,
+        })
+
+        # Quantile table + mean
+        summary = scenarios.quantile(qs).T
+        summary.insert(0, "mean", scenarios.mean())
+
+        # Trigger probabilities (append as extra rows)
+        prob = pd.DataFrame(
+            {
+                "mean": [
+                    (pv_hgb > 0).mean(),
+                    (pv_perf > 0).mean(),
+                    (pv_net < 0).mean(),
+                ],
+            },
+            index=["prob_hgb_trigger", "prob_perf_trigger", "prob_net_negative"],
+        )
+        # Fill quantile columns with NaN for probability rows
+        for q in qs:
+            prob[q] = np.nan
+
+        return pd.concat([summary, prob])
+
+
+class ICAAPResult:
+    """
+    Container for ICAAP nested Monte Carlo results.
+
+    Holds the per-outer-scenario conditional expected PV of each contingent
+    obligation at the 1-year horizon, plus the baseline PV and discount
+    factor needed to compute capital.
+
+    Attributes
+    ----------
+    pv_hgb_t1   : (n_outer,)  E[PV(HGB payments)   | state at t=1]
+    pv_perf_t1  : (n_outer,)  E[PV(perf. payment)   | state at t=1]
+    pv0         : scalar       baseline E[PV(total obligations)] at t=0
+    df_1y       : scalar       1-year discount factor  (1+y)^{-dt}
+    """
+
+    _DEFAULT_QUANTILES = [0.005, 0.05, 0.25, 0.50, 0.75, 0.95, 0.995]
+
+    def __init__(
+        self,
+        pv_hgb_t1: np.ndarray,
+        pv_perf_t1: np.ndarray,
+        pv0: float,
+        df_1y: float,
+        n_outer: int,
+        n_inner: int,
+    ):
+        self.pv_hgb_t1  = pv_hgb_t1
+        self.pv_perf_t1 = pv_perf_t1
+        self.pv0  = pv0
+        self.df_1y = df_1y
+        self.n_outer = n_outer
+        self.n_inner = n_inner
+
+    # --- derived quantities ---
+
+    @property
+    def pv_total_t1(self) -> np.ndarray:
+        """Conditional expected PV of total obligations at the 1-year horizon."""
+        return self.pv_hgb_t1 + self.pv_perf_t1
+
+    @property
+    def pv_total_discounted(self) -> np.ndarray:
+        """PV of total obligations discounted back to val_date."""
+        return self.pv_total_t1 * self.df_1y
+
+    @property
+    def delta_pv(self) -> np.ndarray:
+        """1-year change in PV(obligations), discounted to val_date."""
+        return self.pv_total_discounted - self.pv0
+
+    # --- capital measures ---
+
+    def var(self, confidence: float = 0.995) -> float:
+        """Value-at-Risk of the 1-year PV change."""
+        return float(np.quantile(self.delta_pv, confidence))
+
+    def tvar(self, confidence: float = 0.995) -> float:
+        """Tail Value-at-Risk (Expected Shortfall) of the 1-year PV change."""
+        d = self.delta_pv
+        threshold = np.quantile(d, confidence)
+        tail = d[d >= threshold]
+        return float(tail.mean()) if len(tail) > 0 else float(threshold)
+
+    # --- reporting ---
+
+    def summary(self, quantiles: Optional[List[float]] = None) -> pd.DataFrame:
+        """
+        Summary table: quantile distribution of each metric plus capital measures.
+        """
+        qs = quantiles or self._DEFAULT_QUANTILES
+
+        scenarios = pd.DataFrame({
+            "pv_hgb_t1":          self.pv_hgb_t1,
+            "pv_perf_t1":         self.pv_perf_t1,
+            "pv_total_t1":        self.pv_total_t1,
+            "pv_total_discounted": self.pv_total_discounted,
+            "delta_pv":           self.delta_pv,
+        })
+
+        tbl = scenarios.quantile(qs).T
+        tbl.insert(0, "mean", scenarios.mean())
+
+        # Capital rows
+        cap = pd.DataFrame(
+            {"mean": [self.var(), self.tvar(), self.pv0]},
+            index=["capital_var_995", "capital_tvar_995", "pv0_baseline"],
+        )
+        for q in qs:
+            cap[q] = np.nan
+
+        return pd.concat([tbl, cap])
 
 
 class FoxConfig:
@@ -938,3 +1167,371 @@ class CDIMandate_Fox:
         df["net_bt_return"] = df["bt"] + self.config.cmbp_margin
 
         return CDISimulationResult(config=self.config, bond_sim=bond_sim, cdi_sim=df)
+
+    def icaap_capital(
+        self,
+        val_date: datetime,
+        rates: Rates,
+        spread_map: dict,
+        cr_model: CreditRiskModel,
+        base_result: CDISimulationResult,
+        n_outer: int = 500,
+        n_inner: int = 500,
+        chunk_size: int = 50,
+    ) -> ICAAPResult:
+        """
+        Nested Monte Carlo estimation of the 1-year distribution of
+        PV(contingent obligations) for ICAAP capital.
+
+        Approach
+        --------
+        1. Run a 1-year *outer* credit simulation  →  n_outer states at t=1
+           (migrated ratings, updated cash / HGB gap / bund comparator).
+        2. From each outer state, run n_inner *inner* credit paths over the
+           remaining mandate life and execute the asset-liability waterfall.
+        3. For each outer scenario, take the mean PV(obligations) across the
+           inner paths  →  E[PV | state_t=1].
+        4. The distribution of these conditional expectations across the
+           outer scenarios gives the 1-year capital distribution.
+
+        Performance
+        -----------
+        Three optimisations over naive nesting:
+        * **Analytical bund comparator.**  The CMBP/bund benchmark returns
+          are deterministic (forward rates), so the bund comparator at any
+          future year is a closed-form function of the outer state and the
+          (stochastic) additional-payment injection.  The entire inner CMBP
+          bond simulation and total_returns computation are eliminated.
+        * **Chunked processing.**  Outer scenarios are batched in groups of
+          ``chunk_size`` to cap peak memory at
+          O(chunk_size × n_inner × T × n_bonds).
+        * **Lean inner sim.**  Only CDI-allocation cashflows and PVs are
+          extracted from the inner bond simulation (no CMBP allocation,
+          no return computation, no full DataFrame construction).
+
+        Parameters
+        ----------
+        val_date     : Valuation date (same as the base simulation).
+        rates        : Bund yield curve.
+        spread_map   : Rating → credit spread mapping.
+        cr_model     : CreditRiskModel used for the base simulation.
+        base_result  : CDISimulationResult from a full-horizon base run,
+                       used to obtain the baseline PV(obligations) at t=0.
+        n_outer      : Number of 1-year outer scenarios.
+        n_inner      : Number of inner paths per outer scenario.
+        chunk_size   : Outer scenarios processed per batch (controls memory).
+
+        Returns
+        -------
+        ICAAPResult with the full distribution and capital estimates.
+
+        Notes
+        -----
+        - Interest rates are held constant (credit risk capital only).
+        - Total compound paths = n_outer × n_inner; keep this tractable.
+        - For production, consider replacing the inner simulation with an
+          LSMC regression for orders-of-magnitude speedup.
+        """
+        # ── Horizon from the base simulation ──
+        n_years = base_result.bond_sim.total_cashflows.shape[1]
+        if n_years < 2:
+            raise ValueError("ICAAP requires n_years >= 2.")
+        n_years_inner = n_years - 1
+
+        # ══════════════════════════════════════════════════════════════
+        #  DETERMINISTIC SCHEDULE  (computed once for the full horizon)
+        # ══════════════════════════════════════════════════════════════
+        liab_series     = self.liabilities.cashflows.loc[val_date:][:n_years]
+        liab_cashflows  = np.asarray(liab_series.values, dtype=float)
+        dates           = pd.DatetimeIndex(liab_series.index)
+        T               = len(dates)
+        dt_full         = calc_dt(dates, val_date)
+
+        liab_pv_gaap = np.asarray(
+            self.liabilities.pv(val_date, self.config.r_gaap, timeline=True, n_years=n_years), dtype=float
+        )
+        liab_pv_ifrs = np.asarray(
+            self.liabilities.pv(val_date, self.config.r_ifrs, timeline=True, n_years=n_years), dtype=float
+        )
+
+        cum_liab_cfs = liab_cashflows.cumsum()
+        meltdown_liabs = np.maximum(
+            0.0,
+            (self.config.heubeck_liabilities - cum_liab_cfs)
+            * self.config.mortality_buffer
+            * ((1 + self.config.r_gaap) ** dt_full),
+        )
+
+        full_cfs = np.asarray(self.liabilities.cashflows.loc[val_date:].values, dtype=float)
+        if len(full_cfs) < T + 2:
+            raise ValueError(
+                f"Liability cashflows too short: need {T + 2} from val_date, got {len(full_cfs)}."
+            )
+        next2 = full_cfs[1 : T + 1] + full_cfs[2 : T + 2]
+
+        fwds_full   = np.asarray(rates.calc_fwds(val_date, dates).values, dtype=float)
+        yields_full = np.asarray(rates.interpolate(dates).values, dtype=float)
+
+        asset_buffer_full = np.array([
+            self.config.asset_buffer * ((1 + self.config.r_ifrs) ** (t + 1))
+            if t < 10 else 0.0
+            for t in range(T)
+        ])
+
+        # Inner-only slices (year 2+ of the original waterfall)
+        T_inner            = T - 1
+        inner_fwds         = fwds_full[1:]
+        inner_yields       = yields_full[1:]
+        inner_liab_cfs     = liab_cashflows[1:]
+        inner_meltdown     = meltdown_liabs[1:]
+        inner_next2        = next2[1:]
+        inner_liab_pv_gaap = liab_pv_gaap[1:]
+        inner_liab_pv_ifrs = liab_pv_ifrs[1:]
+        inner_asset_buffer = asset_buffer_full[1:]
+
+        # Discount factors for PV: inner dates → inner_val_date
+        inner_dt = dt_full[1:] - dt_full[0]
+        inner_df = (1 + inner_yields) ** (-inner_dt)                      # (T_inner,)
+
+        # ══════════════════════════════════════════════════════════════
+        #  ANALYTICAL BUND COMPARATOR  (deterministic — precompute once)
+        # ══════════════════════════════════════════════════════════════
+        #
+        #  With bt = forward rates the bund comparator evolves as:
+        #    bund[t] = bund[t-1] * g[t] - liab[t] + additional[t]
+        #  where g[t] = 1 + fwd[t] + margin  (deterministic).
+        #
+        #  Unrolling:
+        #    bund[T] = bund_start * G(0,T)
+        #            - Σ_{s=0}^{T} liab[s] * G(s+1,T)
+        #            + additional[a] * G(a+1,T)
+        #  where G(a,b) = Π_{j=a}^{b} g[j].
+        #
+        #  We only need bund at the performance-payment year.
+
+        inner_g = 1 + inner_fwds + self.config.cmbp_margin                # (T_inner,)
+        cum_g   = np.cumprod(inner_g)                                     # cum_g[t] = G(0,t)
+
+        perf_inner_t = self.config.performance_payment_year - 2           # inner-loop index
+        ap_inner_t   = self.config.additional_payment_year - 2
+        has_perf     = 0 <= perf_inner_t < T_inner
+
+        if has_perf:
+            bund_growth = cum_g[perf_inner_t]                             # G(0, perf)
+            # Liability drain compounded forward to perf year:
+            # drain = Σ liab[s] * G(s+1, perf) = cum_g[perf] * Σ liab[s]/cum_g[s]
+            bund_drain = float(
+                bund_growth * (inner_liab_cfs[: perf_inner_t + 1] / cum_g[: perf_inner_t + 1]).sum()
+            )
+            # Growth factor to compound additional payment forward to perf year
+            if 0 <= ap_inner_t <= perf_inner_t:
+                ap_fwd_growth = float(cum_g[perf_inner_t] / cum_g[ap_inner_t])
+            else:
+                ap_fwd_growth = 0.0
+
+            # Discount factor for perf payment → inner_val_date
+            perf_df = float(inner_df[perf_inner_t])
+
+        # ══════════════════════════════════════════════════════════════
+        #  STEP 1 — 1-YEAR OUTER SIMULATION
+        # ══════════════════════════════════════════════════════════════
+        outer_cr  = cr_model.run(n_outer, 1)
+        outer_cdi = self.run(val_date, rates, spread_map, outer_cr)
+
+        # Extract t=1 state per outer scenario  (all length n_outer)
+        df1 = outer_cdi.cdi_sim
+        cash_outer    = df1["cash"].values
+        hgb_gap_outer = df1["hgb_gap"].values
+        cum_hgb_outer = df1["hgb_payment"].values
+        bund_outer    = df1["bund_comparator"].values
+
+        # Issuer ratings at t=1  (n_outer × n_issuers)
+        year1_mask    = outer_cr.transitions.index.get_level_values("year") == 1
+        year1_ratings = outer_cr.transitions.loc[year1_mask].values
+
+        # Which bonds were already in default after the outer year
+        outer_bond_ratings = outer_cdi.bond_sim.transitions[:, 0, :]
+        already_defaulted  = (outer_bond_ratings == DEFAULT_LABEL)
+
+        # Pre-map rating labels → integer indices (once, before chunking)
+        tm = cr_model.transition_matrix
+        initial_indices_all = np.array([
+            [tm.label_to_idx[r] for r in year1_ratings[s]]
+            for s in range(n_outer)
+        ])                                                                # (n_outer, n_issuers)
+
+        # ══════════════════════════════════════════════════════════════
+        #  STEP 2–6 — CHUNKED INNER SIMULATION
+        # ══════════════════════════════════════════════════════════════
+        n_issuers    = len(cr_model.issuer_ids)
+        n_sectors    = cr_model.sector_map.nunique()
+        rho_s_i      = cr_model.rho_s[cr_model.sector_map]
+        inner_val_date = dates[0]
+
+        # Pre-compute factor-model coefficient vectors (constant across chunks)
+        sqrt_rho_e   = np.sqrt(cr_model.rho_e)
+        sqrt_rho_s_e = np.sqrt(rho_s_i - cr_model.rho_e)                 # (n_issuers,)
+        sqrt_1_rho_s = np.sqrt(1 - rho_s_i)                              # (n_issuers,)
+
+        pv_hgb_cond  = np.empty(n_outer)
+        pv_perf_cond = np.empty(n_outer)
+
+        for c_start in range(0, n_outer, chunk_size):
+            c_end  = min(c_start + chunk_size, n_outer)
+            n_c    = c_end - c_start
+            N_c    = n_c * n_inner
+
+            # ── Inner credit draws ──
+            E       = np.random.normal(size=(N_c, n_years_inner))
+            S       = np.random.normal(size=(N_c, n_years_inner, n_sectors))
+            I_noise = np.random.normal(size=(N_c, n_years_inner, n_issuers))
+
+            X = (
+                sqrt_rho_e * E[:, :, np.newaxis]
+                + sqrt_rho_s_e[np.newaxis, np.newaxis, :] * S[:, :, cr_model.sector_map]
+                + sqrt_1_rho_s[np.newaxis, np.newaxis, :] * I_noise
+            )
+            pX = sp.stats.norm.cdf(X)
+
+            # ── Transitions from chunk's initial ratings ──
+            init_chunk = np.repeat(
+                initial_indices_all[c_start:c_end], n_inner, axis=0
+            )
+            inner_trans_arr = tm.transitions_from_state(pX, init_chunk)
+
+            # Package into SimulationResult for Bonds.run_sim
+            inner_trans_df = pd.DataFrame(
+                inner_trans_arr.reshape(N_c * (n_years_inner + 1), n_issuers),
+                index=pd.MultiIndex.from_product(
+                    [range(N_c), range(n_years_inner + 1)], names=["sim", "year"]
+                ),
+                columns=cr_model.issuer_ids,
+            )
+            inner_sim = SimulationResult(
+                E, S, I_noise, X, pX, inner_trans_df, N_c, n_years_inner
+            )
+
+            # ── Inner bond sim (CDI only — no CMBP needed) ──
+            inner_bond_sim = self.bonds.run_sim(
+                inner_val_date, rates, spread_map, inner_sim
+            )
+
+            # Fix double-recovery for bonds defaulted in the outer year
+            already_def_c = np.repeat(
+                already_defaulted[c_start:c_end], n_inner, axis=0
+            )
+            inner_bond_sim.recovery_payments[:, 0, :] *= ~already_def_c
+            inner_bond_sim.total_cashflows = (
+                inner_bond_sim.received_cashflows
+                + inner_bond_sim.recovery_payments
+            )
+
+            # ── CDI portfolio allocation only ──
+            shape_c = (N_c, T_inner)
+            asset_cfs = allocate_bond_sim(
+                inner_bond_sim, self.cdi_allocation, shape_c, "cashflows"
+            )
+            asset_pvs = allocate_bond_sim(
+                inner_bond_sim, self.cdi_allocation, shape_c, "pvs"
+            )
+
+            # Free bond-level arrays — only portfolio totals needed from here
+            del inner_bond_sim, inner_trans_arr, inner_trans_df, inner_sim
+            del E, S, I_noise, X, pX
+
+            # ── Inner waterfall ──
+            cash_t    = np.repeat(np.array(cash_outer[c_start:c_end], dtype=float),    n_inner)
+            hgb_gap_t = np.repeat(np.array(hgb_gap_outer[c_start:c_end], dtype=float), n_inner)
+            cum_hgb   = np.repeat(np.array(cum_hgb_outer[c_start:c_end], dtype=float), n_inner)
+
+            hgb_arr              = np.zeros(shape_c)
+            additional_injected  = np.zeros(N_c)
+            assets_at_perf       = np.zeros(N_c)
+
+            for t in range(T_inner):
+                orig_t = t + 1
+
+                # Fee
+                fee_t = self.config.fee * (
+                    cash_t * (1 + inner_fwds[t])
+                    + asset_pvs[:, t]
+                    + asset_cfs[:, t]
+                )
+
+                # Cash after cashflows, liability payment and fee
+                cash_t = (
+                    cash_t * (1 + inner_fwds[t])
+                    + asset_cfs[:, t]
+                    - inner_liab_cfs[t]
+                    - fee_t
+                )
+                assets_t = cash_t + asset_pvs[:, t]
+
+                # HGB gap and payment
+                hgb_gap_t = np.clip(
+                    inner_meltdown[t] - (assets_t + inner_asset_buffer[t]),
+                    0.0, hgb_gap_t,
+                )
+                hgb_pay_t = np.clip(
+                    inner_next2[t] - assets_t,
+                    0.0, hgb_gap_t - cum_hgb,
+                )
+                cash_t   += hgb_pay_t
+                assets_t += hgb_pay_t
+                cum_hgb  += hgb_pay_t
+
+                # Additional payment
+                if orig_t == self.config.additional_payment_year - 1:
+                    add_t = np.clip(
+                        np.minimum(
+                            inner_liab_pv_gaap[t] - assets_t,
+                            1.1 * inner_liab_pv_ifrs[t] - assets_t,
+                        ),
+                        0.0, inner_asset_buffer[t],
+                    )
+                    cash_t              += add_t
+                    assets_t            += add_t
+                    additional_injected += add_t
+
+                # Capture assets at performance year for bund comparison
+                if t == perf_inner_t:
+                    assets_at_perf = assets_t.copy()
+
+                hgb_arr[:, t] = hgb_pay_t
+
+            # ── Analytical bund comparator at performance year ──
+            if has_perf:
+                bund_chunk = np.repeat(np.array(bund_outer[c_start:c_end], dtype=float), n_inner)
+                bund_at_perf = (
+                    bund_chunk * bund_growth
+                    - bund_drain
+                    + additional_injected * ap_fwd_growth
+                )
+                perf_payment = np.clip(
+                    bund_at_perf - assets_at_perf, 0.0, self.config.performance_cap
+                )
+                pv_perf_path = perf_payment * perf_df
+            else:
+                pv_perf_path = np.zeros(N_c)
+
+            # ── PV of HGB obligations ──
+            pv_hgb_path = (hgb_arr * inner_df[np.newaxis, :]).sum(axis=1)
+
+            # ── Average over inner paths per outer scenario ──
+            pv_hgb_cond[c_start:c_end]  = pv_hgb_path.reshape(n_c, n_inner).mean(axis=1)
+            pv_perf_cond[c_start:c_end] = pv_perf_path.reshape(n_c, n_inner).mean(axis=1)
+
+        # ══════════════════════════════════════════════════════════════
+        #  RESULT
+        # ══════════════════════════════════════════════════════════════
+        df_1y = float((1 + yields_full[0]) ** (-dt_full[0]))
+        pv0   = float(base_result.pv_total_obligations().mean())
+
+        return ICAAPResult(
+            pv_hgb_t1  = pv_hgb_cond,
+            pv_perf_t1 = pv_perf_cond,
+            pv0  = pv0,
+            df_1y = df_1y,
+            n_outer = n_outer,
+            n_inner = n_inner,
+        )
