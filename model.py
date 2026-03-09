@@ -39,6 +39,38 @@ def fit_to_shape(a: np.ndarray, shape: tuple) -> np.ndarray:
         pad_widths.append((0, 0))
     return np.pad(trimmed, pad_widths, mode='constant')
 
+def map_spreads_chunked(ratings: np.ndarray, spread_map: Dict[str, float], chunk_size: int = 1000) -> np.ndarray:
+    """
+    Chunked, vectorised rating-label → spread lookup.
+
+    Parameters
+    - ratings: ndarray of rating labels (any shape). Typically dtype=object/str.
+    - spread_map: mapping from rating label -> spread.
+    - chunk_size: number of elements processed per chunk (flattened).
+    - default: value used when a rating is missing from `spread_map`.
+    - out: optional preallocated output array (same shape as `ratings`).
+
+    Returns
+    - ndarray of spreads with same shape as `ratings`.
+    """
+    flat = np.asarray(ratings).ravel()
+
+    out_arr = np.empty(flat.shape, dtype=float)
+
+    n = flat.size
+    for start in range(0, n, chunk_size):
+        stop = min(start + chunk_size, n)
+        chunk = flat[start:stop]
+        # Factorise per chunk to avoid a single massive codes/uniques allocation.
+        codes, uniques = pd.factorize(chunk, sort=False)
+        mapped = np.fromiter(
+            (spread_map.get(u, 0.0) for u in uniques),
+            dtype=float,
+            count=len(uniques),
+        )
+        out_arr[start:stop] = mapped[codes]
+
+    return out_arr.reshape(ratings.shape)
 
 def map_spreads(ratings: np.ndarray, spread_map: Dict[str, float]) -> np.ndarray:
     """Vectorised rating-label → spread lookup."""
@@ -143,15 +175,16 @@ class TransitionMatrix:
 
         return self.indices_to_labels(res)
 
-    def transitions_from_state(self, pX: np.ndarray, initial_indices: np.ndarray) -> np.ndarray:
+    def transitions_from_matrix(self, pX: np.ndarray, initial_indices: np.ndarray) -> np.ndarray:
         """
         Same as *transitions* but with per-simulation initial ratings.
         initial_indices: (n_sim, n_issuers) int array.
         """
         n_sim, n_years, n_issuers = pX.shape
 
+        initial_indices_int = np.array([[self.label_to_idx[r] for r in initial_indices[s]] for s in range(n_sim)])
         res = np.empty((n_sim, n_years + 1, n_issuers), dtype=np.int32)
-        res[:, 0, :] = initial_indices
+        res[:, 0, :] = initial_indices_int
 
         for t in range(n_years):
             cum = self.cum_tmatrix[res[:, t, :]]
@@ -162,13 +195,13 @@ class TransitionMatrix:
 
         return self.indices_to_labels(res)
 
-    def fundamental_matrix(self):
+    def fundamental_matrix(self) -> pd.DataFrame:
         Q = self.tmatrix[:-1, :-1]
         N = np.linalg.inv(np.eye(len(Q)) - Q)
         labels = self.labels[:-1]
         return pd.DataFrame(N, index=labels, columns=labels)
 
-    def time_to_default(self):
+    def time_to_default(self) -> pd.Series:
         N = self.fundamental_matrix().values
         t = N @ np.ones(len(N))
         return pd.Series(t, index=self.labels[:-1], name='Time to Default')
@@ -179,7 +212,7 @@ class TransitionMatrix:
 
 class SimulationResult:
     """Container for CreditRiskModel outputs."""
-    def __init__(self, E, S, I, X, pX, transitions, n_sim, n_years):
+    def __init__(self, E, S, I, X, pX, transitions, n_sim, n_years, rho_e=None, rho_s=None):
         self.E = E
         self.S = S
         self.I = I
@@ -188,6 +221,8 @@ class SimulationResult:
         self.transitions = transitions
         self.n_sim = n_sim
         self.n_years = n_years
+        self.rho_e = rho_e
+        self.rho_s = rho_s
 
 
 class CreditRiskModel:
@@ -230,7 +265,40 @@ class CreditRiskModel:
         if np.any(self.rho_e > self.rho_s):
             raise ValueError("rho_s must be >= rho_e")
 
-    def run(self, n_sim: int, n_years: int) -> "SimulationResult":
+    def _run_pX(self, n_sim, n_years, n_issuers, sector_map) -> np.ndarray:
+
+        n_sectors = sector_map.nunique()
+        E = np.random.normal(size=(n_sim, n_years))
+        S = np.random.normal(size=(n_sim, n_years, n_sectors))
+        I = np.random.normal(size=(n_sim, n_years, n_issuers))
+        X = (
+            np.sqrt(self.rho_e) * E[:, :, np.newaxis]
+            + np.sqrt(self.rho_s[sector_map] - self.rho_e)[np.newaxis, np.newaxis, :] * S[:, :, sector_map]
+            + np.sqrt(1 - self.rho_s[sector_map])[np.newaxis, np.newaxis, :] * I
+        )
+        pX = sp.stats.norm.cdf(X)
+
+        return pX
+
+    def run_matrix(self, n_sim, n_years, n_issuers, sector_map, matrix: np.ndarray) -> SimulationResult:
+         """Run the full simulation and return all outputs."""
+
+         pX = self._run_pX(n_sim, n_years, n_issuers, sector_map)
+         transitions = self.transition_matrix.transitions_from_matrix(pX, matrix)
+         transitions = pd.DataFrame(
+             transitions.reshape(n_sim * (n_years + 1), n_issuers),
+             index=pd.MultiIndex.from_product(
+                 [range(n_sim), range(n_years + 1)], names=["sim", "year"]
+             ),
+             columns=self.issuer_ids,
+         )
+         return SimulationResult(
+             E=None, S=None, I=None, X=None, pX=pX, transitions=transitions, n_sim=n_sim, n_years=n_years
+         )
+
+    def run(self, n_sim: float, n_years: int) -> SimulationResult:
+
+        n_sim = int(n_sim)
         n_issuers = len(self.ratings_map)
         n_sectors = self.sector_map.nunique()
 
@@ -254,7 +322,7 @@ class CreditRiskModel:
             ),
             columns=self.issuer_ids,
         )
-        return SimulationResult(E, S, I, X, pX, transitions, n_sim, n_years)
+        return SimulationResult(E, S, I, X, pX, transitions, n_sim, n_years, self.rho_e, self.rho_s)
 
 
 # ---------------------------------------------------------------------------
@@ -302,14 +370,12 @@ class Bonds:
     """Bond universe: cashflows, issuer links, and simulation."""
 
     def __init__(self, ids: list, issuer_ids: pd.Series, recoveries: pd.Series,
-                 cashflows: pd.DataFrame, issuers: Issuers,
-                 descriptions: pd.Series | None = None):
+                 cashflows: pd.DataFrame, issuers: Issuers):
         self.ids = ids
         self.issuer_ids = issuer_ids
         self.recoveries = recoveries
         self.cashflows = cashflows[ids].sort_index()
         self.issuers = issuers
-        self.descriptions = descriptions
         self._validate()
 
     def _validate(self) -> None:
@@ -365,15 +431,14 @@ class Bonds:
         prices = (cfs.values * dfs).sum(axis=0)
         return pd.Series(prices, index=self.ids)
 
-    def _run_sim_pv(self, cashflows: np.ndarray, bond_transitions: np.ndarray,
-                    spread_map: dict, yields: np.ndarray, dt: np.ndarray) -> np.ndarray:
+    def _run_sim_pv(self, cashflows: np.ndarray, bond_transitions: np.ndarray, spread_map: dict, yields: np.ndarray, dt: np.ndarray) -> np.ndarray:
         n_years_cf, n_bonds = cashflows.shape
         n_sim, n_years_sim, _ = bond_transitions.shape
         n_years = min(n_years_cf, n_years_sim)
         assert cashflows.shape[1] == bond_transitions.shape[2]
 
         unique_spreads, spread_inverse = np.unique(
-            map_spreads(bond_transitions, spread_map), return_inverse=True
+            map_spreads_chunked(bond_transitions, spread_map), return_inverse=True
         )
         n_unique = len(unique_spreads)
 
@@ -392,8 +457,7 @@ class Bonds:
         b_idx = np.arange(n_bonds)[np.newaxis, np.newaxis, :]
         return pv_table[spread_idx, t_idx, b_idx]
 
-    def run_sim(self, val_date: datetime, rates: Rates, spread_map: dict,
-                sim_results: SimulationResult) -> BondSimulationResult:
+    def run_sim(self, val_date: datetime, rates: Rates, spread_map: dict, sim_results: SimulationResult) -> BondSimulationResult:
         """Project cashflows and revalue bonds across all scenarios."""
 
         cashflows_df = self.year_end_cashflows(val_date)
@@ -503,23 +567,6 @@ def allocate_bond_sim(bond_sim: BondSimulationResult, allocation: pd.Series,
 
     return fit_to_shape((nominal * allocs).sum(axis=2), shape)
 
-
-class _Schedule:
-    """Pre-computed deterministic arrays used by the CDI waterfall."""
-    liab_cashflows: np.ndarray
-    dates: pd.DatetimeIndex
-    T: int
-    dt: np.ndarray
-    liab_pv_gaap: np.ndarray
-    liab_pv_ifrs: np.ndarray
-    meltdown_liabs: np.ndarray
-    next2: np.ndarray
-    fwds: np.ndarray
-    yields: np.ndarray
-    asset_buffer: np.ndarray
-    exp_cdi_cf: np.ndarray
-
-
 # ---------------------------------------------------------------------------
 #  CDI result containers
 # ---------------------------------------------------------------------------
@@ -529,10 +576,12 @@ class CDISimulationResult:
 
     _DEFAULT_QUANTILES = [0.005, 0.05, 0.25, 0.50, 0.75, 0.95, 0.995]
 
-    def __init__(self, config: "FoxConfig", bond_sim: BondSimulationResult, cdi_sim: pd.DataFrame):
+    def __init__(self, config: "FoxConfig", schedule: dict, bond_sim: BondSimulationResult, cdi_sim: pd.DataFrame, sim_results: SimulationResult):
         self.config = config
+        self.schedule = schedule
         self.bond_sim = bond_sim
         self.cdi_sim = cdi_sim
+        self.sim_results = sim_results
 
     def _discount_factors(self) -> pd.Series:
         df = self.cdi_sim
@@ -585,61 +634,66 @@ class CDISimulationResult:
 
         return pd.concat([summary, prob])
 
+    def write_output(self, output_location, folder_name):
+        import json
+
+        target_dir = output_location / folder_name
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # Config with added correlation parameters
+        config_dict = self.config.to_dict()
+        config_dict['timestamp '] = pd.Timestamp.now().isoformat()
+        config_dict['rho_s'] = list(self.sim_results.rho_s)
+        config_dict['rho_e'] = self.sim_results.rho_e
+        config_dict['n_sim'] = self.sim_results.n_sim
+        config_dict['n_years'] = self.sim_results.n_years
+        with open(output_location / f"{folder_name}/config.json", "w", encoding="utf-8") as f: json.dump(config_dict, f, indent=2, sort_keys=True)
+
+        # Static results
+        dict = self.schedule
+        det_df = pd.DataFrame(dict).drop(columns=['T'])
+        det_df.to_csv(output_location / f"{folder_name}/static_results.csv", index=False)
+
+        # Bond simulation results
+        selected_cols = [
+            'date',
+            'scenario',
+            'remaining_asset_pv',
+            'asset_cashflow',
+            'cash',
+            'assets',
+            'hgb_gap',
+            'additional_payment',
+            'fee',
+            'hgb_payment',
+            'bund_comparator',
+            'performance_payment'
+        ]
+        df = self.cdi_sim[selected_cols]
+        df.to_csv(output_location / f"{folder_name}/cdi_sim.csv", index=False)
+
 
 class ICAAPResult:
     """Container for ICAAP nested Monte-Carlo capital results."""
 
     _DEFAULT_QUANTILES = [0.005, 0.05, 0.25, 0.50, 0.75, 0.95, 0.995]
 
-    def __init__(self, pv_hgb_t1, pv_perf_t1, pv0, df_1y, n_outer, n_inner, icaap_df: Optional[pd.DataFrame] = None):
+    def __init__(self, pv_hgb_t1, pv_perf_t1, pv_fee_t1, icaap_df: Optional[pd.DataFrame] = None):
         self.pv_hgb_t1  = pv_hgb_t1
         self.pv_perf_t1 = pv_perf_t1
-        self.pv0  = pv0
-        self.df_1y = df_1y
-        self.n_outer = n_outer
-        self.n_inner = n_inner
+        self.pv_fee_t1 = pv_fee_t1
         self.icaap_df = icaap_df
-
-    @property
-    def pv_total_t1(self):
-        return self.pv_hgb_t1 + self.pv_perf_t1
-
-    @property
-    def pv_total_discounted(self):
-        return self.pv_total_t1 * self.df_1y
-
-    @property
-    def delta_pv(self):
-        return self.pv_total_discounted - self.pv0
-
-    def var(self, confidence: float = 0.995) -> float:
-        return float(np.quantile(self.delta_pv, confidence))
-
-    def tvar(self, confidence: float = 0.995) -> float:
-        d = self.delta_pv
-        threshold = np.quantile(d, confidence)
-        tail = d[d >= threshold]
-        return float(tail.mean()) if len(tail) > 0 else float(threshold)
 
     def summary(self, quantiles: Optional[List[float]] = None) -> pd.DataFrame:
         qs = quantiles or self._DEFAULT_QUANTILES
         scenarios = pd.DataFrame({
-            "pv_hgb_t1":           self.pv_hgb_t1,
-            "pv_perf_t1":          self.pv_perf_t1,
-            "pv_total_t1":         self.pv_total_t1,
-            "pv_total_discounted": self.pv_total_discounted,
-            "delta_pv":            self.delta_pv,
+            "pv_hgb_t1": self.pv_hgb_t1,
+            "pv_perf_t1": self.pv_perf_t1,
+            "pv_fee_t1": self.pv_fee_t1
         })
         tbl = scenarios.quantile(qs).T
         tbl.insert(0, "mean", scenarios.mean())
-
-        cap = pd.DataFrame(
-            {"mean": [self.var(), self.tvar(), self.pv0]},
-            index=["capital_var_995", "capital_tvar_995", "pv0_baseline"],
-        )
-        for q in qs:
-            cap[q] = np.nan
-        return pd.concat([tbl, cap])
+        return tbl
 
 
 # ---------------------------------------------------------------------------
@@ -649,6 +703,7 @@ class ICAAPResult:
 class FoxConfig:
     def __init__(
         self,
+        val_date: datetime,
         heubeck_liabilities,
         r_gaap,
         r_ifrs,
@@ -657,9 +712,12 @@ class FoxConfig:
         mortality_buffer,
         fee,
         performance_cap,
+        cash,
+        cdi_t0,
         additional_payment_year: int = 10,
-        performance_payment_year: int = 25,
+        performance_payment_year: int = 25
     ):
+        self.val_date = val_date
         self.heubeck_liabilities = heubeck_liabilities
         self.r_gaap = r_gaap
         self.r_ifrs = r_ifrs
@@ -670,6 +728,8 @@ class FoxConfig:
         self.performance_cap = performance_cap
         self.additional_payment_year = additional_payment_year
         self.performance_payment_year = performance_payment_year
+        self.cash = cash
+        self.cdi_t0 = cdi_t0
 
     def to_dict(self):
         return vars(self)
@@ -688,76 +748,85 @@ class CDIMandate_Fox:
         self.cmbp_allocation = cmbp_allocation
         self.config = config
 
-    # ------------------------------------------------------------------
-    #  Shared helpers
-    # ------------------------------------------------------------------
-
-    def _build_schedule(self, val_date: datetime, rates: Rates, n_years: int) -> _Schedule:
+    def _calc_deterministic(self, val_date: datetime, rates: Rates, n_years: int) -> dict:
         """Pre-compute all deterministic arrays needed by the waterfall."""
-        s = _Schedule()
-        cfg = self.config
+        self.config = self.config
 
         # Liability series
         liab_series = self.liabilities.cashflows.loc[val_date:][:n_years]
-        s.liab_cashflows = np.asarray(liab_series.values, dtype=float)
-        s.dates = pd.DatetimeIndex(liab_series.index)
-        s.T = len(s.dates)
-        s.dt = calc_dt(s.dates, val_date)
+        liab_cashflows = np.asarray(liab_series.values, dtype=float)
+        dates = pd.DatetimeIndex(liab_series.index)
+        T = len(dates)
+        dt = calc_dt(dates, val_date)
 
         # Liability PV timelines
-        s.liab_pv_gaap = np.asarray(self.liabilities.pv(val_date, cfg.r_gaap, timeline=True, n_years=n_years), dtype=float)
-        s.liab_pv_ifrs = np.asarray(self.liabilities.pv(val_date, cfg.r_ifrs, timeline=True, n_years=n_years), dtype=float)
+        liab_pv_gaap = np.asarray(self.liabilities.pv(val_date, self.config.r_gaap, timeline=True, n_years=n_years), dtype=float)
+        liab_pv_ifrs = np.asarray(self.liabilities.pv(val_date, self.config.r_ifrs, timeline=True, n_years=n_years), dtype=float)
 
         # Meltdown liabilities
-        cum_liab = s.liab_cashflows.cumsum()
-        s.meltdown_liabs = np.maximum(
+        cum_liab = liab_cashflows.cumsum()
+        meltdown_liabs = np.maximum(
             0.0,
-            (cfg.heubeck_liabilities - cum_liab) * cfg.mortality_buffer * ((1 + cfg.r_gaap) ** s.dt),
+            (self.config.heubeck_liabilities - cum_liab) * self.config.mortality_buffer * ((1 + self.config.r_gaap) ** dt),
         )
 
         # Next-2-year liabilities
         full_cfs = np.asarray(self.liabilities.cashflows.loc[val_date:].values, dtype=float)
-        if len(full_cfs) < s.T + 2:
-            raise ValueError(f"Liability cashflows too short: need {s.T + 2} from val_date, got {len(full_cfs)}.")
-        s.next2 = full_cfs[1 : s.T + 1] + full_cfs[2 : s.T + 2]
+        if len(full_cfs) < T + 2:
+            raise ValueError(f"Liability cashflows too short: need {T + 2} from val_date, got {len(full_cfs)}.")
+        next2 = full_cfs[1 : T + 1] + full_cfs[2 : T + 2]
 
         # Rates
-        s.fwds   = np.asarray(rates.calc_fwds(val_date, s.dates).values, dtype=float)
-        s.yields = np.asarray(rates.interpolate(s.dates).values, dtype=float)
+        fwds   = np.asarray(rates.calc_fwds(val_date, dates).values, dtype=float)
+        yields = np.asarray(rates.interpolate(dates).values, dtype=float)
+        df = (1 + yields) ** (-dt)
 
         # Asset buffer (accrues at IFRS rate for first 10 years, then 0)
-        s.asset_buffer = np.array([
-            cfg.asset_buffer * ((1 + cfg.r_ifrs) ** (t + 1)) if t < 10 else 0.0
-            for t in range(s.T)
+        asset_buffer = np.array([
+            self.config.asset_buffer * ((1 + self.config.r_ifrs) ** (t + 1)) if t < 10 else 0.0
+            for t in range(T)
         ])
 
         # Expected (no-default) CDI cashflows
         raw = self.bonds.year_end_cashflows(val_date)
         exp = np.asarray((raw[self.cdi_allocation.index] * self.cdi_allocation).sum(axis=1).values, dtype=float)
-        s.exp_cdi_cf = np.pad(exp, (0, max(0, s.T - len(exp))))[:s.T]
+        exp_cdi_cf = np.pad(exp, (0, max(0, T - len(exp))))[:T]
 
-        return s
+        return {
+            "date": dates,
+            "T": T,
+            "dt": dt,
+            "yields": yields,
+            "fwds": fwds,
+            "df": df,
+            "liab_cashflows": liab_cashflows,
+            "liab_pv_gaap": liab_pv_gaap,
+            "liab_pv_ifrs": liab_pv_ifrs,
+            "meltdown_liabs": meltdown_liabs,
+            "next2": next2,
+            "asset_buffer": asset_buffer,
+            "exp_cdi_cf": exp_cdi_cf
+        }
 
-    def _deterministic_bt(self, val_date: datetime, rates: Rates,
-                          schedule: _Schedule) -> tuple[np.ndarray, float]:
+    def _calc_bt(self, val_date: datetime, rates: Rates, schedule: dict) -> tuple[np.ndarray, float]:
         """
         CMBP total returns are deterministic because all CMBP bonds carry the
         AAAA rating, which is absorbing (no migration, no default).
         Returns (bt, cmbp_t0) where bt has shape (T,).
         """
+
+
         raw_cfs = self.bonds.year_end_cashflows(val_date)
         cmbp_ids = self.cmbp_allocation.index
 
-        # Portfolio cashflows per year (full horizon, may extend beyond T)
-        cmbp_cfs = np.asarray(
-            (raw_cfs[cmbp_ids] * self.cmbp_allocation).sum(axis=1).values, dtype=float
-        )
-
         dates_full = pd.DatetimeIndex(raw_cfs.index)
-        dt_full    = calc_dt(dates_full, val_date)
+        dt_full = calc_dt(dates_full, val_date)
         yields_full = np.asarray(rates.interpolate(dates_full).values, dtype=float)
         n_full = len(dates_full)
-        T = schedule.T
+        T = schedule["T"]
+
+        # Portfolio cashflows per year (full horizon, may extend beyond T)
+        cmbp_cfs = np.asarray((raw_cfs[cmbp_ids] * self.cmbp_allocation).sum(axis=1).values, dtype=float)
 
         # Market value at val_date (AAAA spread = 0)
         cmbp_t0 = float((cmbp_cfs * (1 + yields_full) ** (-dt_full)).sum())
@@ -772,315 +841,301 @@ class CDIMandate_Fox:
         # Annual total returns
         cf_T = cmbp_cfs[:T]
         bt = np.empty(T)
-        bt[0] = (pvs[0] + cf_T[0]) / cmbp_t0 - 1 if cmbp_t0 > 0 else schedule.fwds[0]
+        bt[0] = (pvs[0] + cf_T[0]) / cmbp_t0 - 1 if cmbp_t0 > 0 else schedule["fwds"][0]
         for t in range(1, T):
-            bt[t] = (pvs[t] + cf_T[t]) / pvs[t - 1] - 1 if pvs[t - 1] > 0 else schedule.fwds[t]
+            bt[t] = (pvs[t] + cf_T[t]) / pvs[t - 1] - 1 if pvs[t - 1] > 0 else schedule["fwds"][t]
 
-        return bt, cmbp_t0
+        return bt
 
-    # ------------------------------------------------------------------
-    #  Main simulation
-    # ------------------------------------------------------------------
+    def run(self, val_date: datetime, rates: Rates, spread_map: dict, sim_results: SimulationResult) -> CDISimulationResult:
+        """Value assets and simulate CDI waterfall under each scenario in sim_results."""
 
-    def run(self, val_date: datetime, rates: Rates, spread_map: dict,
-            sim_results: SimulationResult) -> CDISimulationResult:
+        # Extract dimensions
         n_sim = sim_results.n_sim
         max_years = sim_results.n_years
-        cfg = self.config
 
-        # Deterministic schedules
-        sched = self._build_schedule(val_date, rates, max_years)
-        T = sched.T
+        # Pre-calculate all deterministic schedule components (liabilities, rates, buffers, etc.)
+        sched = self._calc_deterministic(val_date, rates, max_years)
+        T = sched["T"]
         shape = (n_sim, T)
 
-        # Deterministic CMBP returns (AAAA bonds never default)
-        bt, _ = self._deterministic_bt(val_date, rates, sched)
-
-        # Portfolio market values at val_date
+        # Initial asset valuation at t=0 (deterministic): PV of bond portfolio + cash
         bond_prices = self.bonds.pv(pd.Timestamp(val_date), rates, spread_map)
         cdi_t0 = (self.cdi_allocation * bond_prices).sum()
         total_assets_0 = cdi_t0 + self.cash
-        day0_hgb_gap = cfg.heubeck_liabilities * cfg.mortality_buffer - (total_assets_0 + cfg.asset_buffer)
 
-        # Stochastic bond simulation → CDI portfolio cashflows & PVs
+        # Initial HGB gap at t=0: difference between Heubeck liabilities and available assets (including buffer)
+        day0_hgb_gap = self.config.heubeck_liabilities * self.config.mortality_buffer - (total_assets_0 + self.config.asset_buffer)
+
+        # Stochastic bond simulation: CDI portfolio cashflows & PVs
         bond_sim  = self.bonds.run_sim(val_date, rates, spread_map, sim_results)
         asset_cfs = allocate_bond_sim(bond_sim, self.cdi_allocation, shape, 'cashflows')
         asset_pvs = allocate_bond_sim(bond_sim, self.cdi_allocation, shape, 'pvs')
 
-        # ── Waterfall ──
-        cash_arr             = np.zeros(shape)
-        assets_arr           = np.zeros(shape)
-        fee_arr              = np.zeros(shape)
-        hgb_gap_arr          = np.zeros(shape)
-        hgb_payment_arr      = np.zeros(shape)
-        perf_payment_arr     = np.zeros(shape)
-        additional_pay_arr   = np.zeros(shape)
-        bund_comparator_arr  = np.zeros(shape)
-        net_asset_ret        = np.zeros(shape)
+        # Deterministic CMBP returns
+        bt = self._calc_bt(val_date, rates, sched)
 
-        cash_t          = np.full(n_sim, self.cash)
-        assets_t        = np.full(n_sim, total_assets_0)
-        hgb_gap_t       = np.full(n_sim, day0_hgb_gap)
-        bund_t          = np.full(n_sim, total_assets_0)
+        # Initial values at t=0
+        cash_t = np.full(n_sim, self.cash)
+        assets_t = np.full(n_sim, total_assets_0)
+        hgb_gap_t = np.full(n_sim, day0_hgb_gap)
+        bund_t = np.full(n_sim, total_assets_0)
         cum_hgb_payment = np.zeros(n_sim)
 
+        # Initialize empty arrays to store waterfall components across all scenarios and time steps
+        cash_arr = np.zeros(shape)
+        assets_arr = np.zeros(shape)
+        fee_arr = np.zeros(shape)
+        hgb_gap_arr = np.zeros(shape)
+        hgb_payment_arr = np.zeros(shape)
+        perf_payment_arr = np.zeros(shape)
+        additional_pay_arr = np.zeros(shape)
+        bund_comparator_arr = np.zeros(shape)
+        net_asset_ret = np.zeros(shape)
+
         for t in range(T):
+            # Store previous assets for return calculation before updating
             prev_assets = assets_t.copy()
 
-            fee_t = cfg.fee * (cash_t * (1 + sched.fwds[t]) + asset_pvs[:, t] + asset_cfs[:, t])
-            cash_t = cash_t * (1 + sched.fwds[t]) + asset_cfs[:, t] - sched.liab_cashflows[t] - fee_t
+            # Calculate fee as a percentage of total asset value (cash + cdi cashflow + PV of remaining assets) before liability payments
+            fee_t = self.config.fee * (cash_t * (1 + sched["fwds"][t]) + asset_cfs[:, t] + asset_pvs[:, t])
+
+            # Update cash and assets after receiving asset cashflows, paying liabilities, and fees
+            cash_t = cash_t * (1 + sched["fwds"][t]) + asset_cfs[:, t] - sched["liab_cashflows"][t] - fee_t
+
+            # Update assets to reflect cash changes and remaining asset PVs
             assets_t = cash_t + asset_pvs[:, t]
 
-            # HGB gap check & top-up
-            hgb_gap_t = np.clip(sched.meltdown_liabs[t] - (assets_t + sched.asset_buffer[t]), 0.0, hgb_gap_t)
-            hgb_pay_t = np.clip(sched.next2[t] - assets_t, 0.0, hgb_gap_t - cum_hgb_payment)
-            cash_t   += hgb_pay_t
+            # Calculate HGB gap and payment as difference between meltdown liabilities and assets + buffer
+            hgb_gap_t = np.clip(sched["meltdown_liabs"][t] - (assets_t + sched["asset_buffer"][t]), 0.0, hgb_gap_t)
+
+            # Pay shortfall up to HGB gap if assets go below the next-2-year liabilities
+            hgb_pay_t = np.clip(sched["next2"][t] - assets_t, 0.0, hgb_gap_t - cum_hgb_payment)
+            cash_t += hgb_pay_t
             assets_t += hgb_pay_t
             cum_hgb_payment += hgb_pay_t
 
-            # Additional injection at configured year
+            # Additional payment from client to bring GAAP funding level up to 100% or IFRS up to 110%, capped by year 10 asset buffer.
             add_t = 0.0
-            if t == cfg.additional_payment_year - 1:
+            if t == self.config.additional_payment_year - 1:
                 add_t = np.clip(
-                    np.minimum(sched.liab_pv_gaap[t] - assets_t, 1.1 * sched.liab_pv_ifrs[t] - assets_t),
-                    0.0, sched.asset_buffer[t],
+                    np.minimum(sched["liab_pv_gaap"][t] - assets_t, 1.1 * sched["liab_pv_ifrs"][t] - assets_t),
+                    0.0, sched["asset_buffer"][t],
                 )
-                cash_t   += add_t
+                cash_t += add_t
                 assets_t += add_t
 
-            # Bund comparator (bt is deterministic → scalar broadcast)
-            bund_t = bund_t * (1 + bt[t] + cfg.cmbp_margin) - sched.liab_cashflows[t] + add_t
+            # Update bund comparator: apply bt return minus liabilities plus any additional payment
+            bund_t = bund_t * (1 + bt[t] + self.config.cmbp_margin) - sched["liab_cashflows"][t] + add_t
 
-            # Performance payment at terminal year
+            # Performance payment at performance_payment_year if assets underperform the bund comparator, capped by the performance cap
             perf_t = (
-                np.clip(bund_t - assets_t, 0.0, cfg.performance_cap)
-                if t == cfg.performance_payment_year - 1 else 0.0
+                np.clip(bund_t - assets_t, 0.0, self.config.performance_cap)
+                if t == self.config.performance_payment_year - 1 else 0.0
             )
 
-            net_ret_t = (assets_t + sched.liab_cashflows[t] - add_t) / prev_assets - 1.0
+            # Calculate net asset return for analysis
+            net_ret_t = (assets_t + sched["liab_cashflows"][t] - add_t) / prev_assets - 1.0
 
-            fee_arr[:, t]            = fee_t
-            cash_arr[:, t]           = cash_t
-            assets_arr[:, t]         = assets_t
-            hgb_gap_arr[:, t]        = hgb_gap_t
-            hgb_payment_arr[:, t]    = hgb_pay_t
-            perf_payment_arr[:, t]   = perf_t
+            # Store results for this time step
+            fee_arr[:, t] = fee_t
+            cash_arr[:, t] = cash_t
+            assets_arr[:, t] = assets_t
+            hgb_gap_arr[:, t] = hgb_gap_t
+            hgb_payment_arr[:, t] = hgb_pay_t
+            perf_payment_arr[:, t] = perf_t
             additional_pay_arr[:, t] = add_t
             bund_comparator_arr[:, t] = bund_t
-            net_asset_ret[:, t]      = net_ret_t
+            net_asset_ret[:, t] = net_ret_t
 
-        # ── Output DataFrame ──
+        # Output DataFrame with MultiIndex (scenario, date) and all relevant columns
         tile = lambda x: np.tile(x, (n_sim, 1))
         results = {
-            "dt":                    tile(sched.dt),
-            "liab_cashflow":         tile(sched.liab_cashflows),
-            "liab_pv_gaap":          tile(sched.liab_pv_gaap),
-            "liab_pv_ifrs":          tile(sched.liab_pv_ifrs),
-            "meltdown_liabilities":  tile(sched.meltdown_liabs),
-            "next_2_liabs":          tile(sched.next2),
-            "bund_fwds":             tile(sched.fwds),
-            "bund_yield":            tile(sched.yields),
-            "expected_cdi_cashflow": tile(sched.exp_cdi_cf),
-            "bt":                    tile(bt),
-            "asset_cashflow":        asset_cfs,
-            "remaining_asset_pv":    asset_pvs,
-            "fee":                   fee_arr,
-            "cash":                  cash_arr,
-            "assets":                assets_arr,
-            "net_asset_return":      net_asset_ret,
-            "hgb_gap":              hgb_gap_arr,
-            "hgb_payment":           hgb_payment_arr,
-            "bund_comparator":       bund_comparator_arr,
-            "performance_payment":   perf_payment_arr,
-            "additional_payment":    additional_pay_arr,
+            "dt": tile(sched["dt"]),
+            "liab_cashflow": tile(sched["liab_cashflows"]),
+            "liab_pv_gaap": tile(sched["liab_pv_gaap"]),
+            "liab_pv_ifrs": tile(sched["liab_pv_ifrs"]),
+            "meltdown_liabilities": tile(sched["meltdown_liabs"]),
+            "next_2_liabs": tile(sched["next2"]),
+            "bund_fwds": tile(sched["fwds"]),
+            "bund_yield": tile(sched["yields"]),
+            "expected_cdi_cashflow": tile(sched["exp_cdi_cf"]),
+            "bt": tile(bt),
+            "asset_cashflow": asset_cfs,
+            "remaining_asset_pv": asset_pvs,
+            "fee": fee_arr,
+            "cash": cash_arr,
+            "assets": assets_arr,
+            "net_asset_return": net_asset_ret,
+            "hgb_gap": hgb_gap_arr,
+            "hgb_payment": hgb_payment_arr,
+            "bund_comparator": bund_comparator_arr,
+            "performance_payment": perf_payment_arr,
+            "additional_payment": additional_pay_arr,
         }
-        index = pd.MultiIndex.from_product([np.arange(n_sim), sched.dates], names=["scenario", "date"])
+        index = pd.MultiIndex.from_product([np.arange(n_sim), sched["date"]], names=["scenario", "date"])
         df = pd.DataFrame({k: v.reshape(-1) for k, v in results.items()}, index=index).reset_index()
 
+        # Additional calculated columns
         df["funding_level_gaap"] = df["assets"] / df["liab_pv_gaap"]
         df["funding_level_ifrs"] = df["assets"] / df["liab_pv_ifrs"]
-        df["net_bt_return"]      = df["bt"] + cfg.cmbp_margin
+        df["net_bt_return"] = df["bt"] + self.config.cmbp_margin
 
-        return CDISimulationResult(config=cfg, bond_sim=bond_sim, cdi_sim=df)
+        return CDISimulationResult(config=self.config, schedule = sched, bond_sim=bond_sim, cdi_sim=df, sim_results=sim_results)
 
-    # ------------------------------------------------------------------
-    #  ICAAP capital (nested Monte-Carlo)
-    # ------------------------------------------------------------------
+    def run_icaap(
+            self,
+            val_date: datetime,
+            rates: Rates,
+            spread_map: dict,
+            cr_model: CreditRiskModel,
+            n_outer: int = 100,
+            n_inner: int = 100,
+            n_years: int = 25,
+            chunk_size: int = 25
+        ) -> ICAAPResult:
+            """
+            Nested Monte-Carlo for the 1-year distribution of PV(obligations).
+            Outer simulation: n_outer 1-year credit scenarios → fund state at t=1.
+            Inner simulation: from each outer state, n_inner paths over the
+                remaining mandate life → conditional E[PV(obligations)].
+            Returns:
+            - ICAAPResult: Summary statistics (pv_hgb_t1, pv_perf_t1, etc.)
+            - DataFrame: Detailed inner waterfall results with MultiIndex (outer_sim, inner_sim, date)
+            """
 
-    def icaap_capital(
-        self,
-        val_date: datetime,
-        rates: Rates,
-        spread_map: dict,
-        cr_model: CreditRiskModel,
-        base_result: CDISimulationResult,
-        n_outer: int = 500,
-        n_inner: int = 500,
-        chunk_size: int = 50,
-    ) -> ICAAPResult:
-        """
-        Nested Monte-Carlo for the 1-year distribution of PV(obligations).
+            # Extract dimensions
+            n_years_inner = n_years - 1
+            cfg = self.config
 
-        Outer simulation: n_outer 1-year credit scenarios → fund state at t=1.
-        Inner simulation: from each outer state, n_inner paths over the
-            remaining mandate life → conditional E[PV(obligations)].
-        The distribution across outer scenarios gives VaR / TVaR.
+            # Get determistic parameters for inner simulation starting from t=1 for each outer scenario.
+            sched = self._calc_deterministic(val_date, rates, n_years)
+            bt = self._calc_bt(val_date, rates, sched)
+            T_inner = sched["T"] - 1
+            inner_dates = sched["date"][1:]
+            inner_val_date = sched["date"][0]
+            inner_fwds = sched["fwds"][1:]
+            inner_yields = sched["yields"][1:]
+            inner_liab_cfs = sched["liab_cashflows"][1:]
+            inner_meltdown = sched["meltdown_liabs"][1:]
+            inner_next2 = sched["next2"][1:]
+            inner_liab_pv_gaap = sched["liab_pv_gaap"][1:]
+            inner_liab_pv_ifrs = sched["liab_pv_ifrs"][1:]
+            inner_asset_buffer = sched["asset_buffer"][1:]
+            inner_dt = sched["dt"][1:] - sched["dt"][0]
+            inner_df = (1 + inner_yields) ** (-inner_dt)
 
-        Returns:
-        - ICAAPResult: Summary statistics (pv_hgb_t1, pv_perf_t1, etc.)
-        - DataFrame: Detailed inner waterfall results with MultiIndex (outer_sim, inner_sim, date)
-        """
-        n_years = base_result.bond_sim.total_cashflows.shape[1]
-        if n_years < 2:
-            raise ValueError("ICAAP requires n_years >= 2.")
-        n_years_inner = n_years - 1
-        cfg = self.config
+            # Run outer cdi simulation for year 1
+            outer_cr = cr_model.run(n_outer, 1)
+            outer_cdi = self.run(val_date, rates, spread_map, outer_cr)
 
-        # ── Deterministic schedules ──
-        sched = self._build_schedule(val_date, rates, n_years)
-        T = sched.T
-        bt, _ = self._deterministic_bt(val_date, rates, sched)
+            # Run risk model for each scenario of issuer ratings at t=1.
+            sector_map = self.bonds.issuers.sectors
+            n_issuers = len(self.bonds.issuers.ids)
 
-        # Inner-year slices (year 2+ of the waterfall)
-        T_inner            = T - 1
-        inner_fwds         = sched.fwds[1:]
-        inner_yields       = sched.yields[1:]
-        inner_liab_cfs     = sched.liab_cashflows[1:]
-        inner_meltdown     = sched.meltdown_liabs[1:]
-        inner_next2        = sched.next2[1:]
-        inner_liab_pv_gaap = sched.liab_pv_gaap[1:]
-        inner_liab_pv_ifrs = sched.liab_pv_ifrs[1:]
-        inner_asset_buffer = sched.asset_buffer[1:]
-        inner_dt           = sched.dt[1:] - sched.dt[0]
-        inner_df           = (1 + inner_yields) ** (-inner_dt)
+            year1_ratings = outer_cr.transitions.query("year == 1").values
 
-        perf_inner_t = cfg.performance_payment_year - 2
-        has_perf     = 0 <= perf_inner_t < T_inner
+            N_all = n_outer * n_inner
 
-        # ── Outer 1-year simulation ──
-        outer_cr  = cr_model.run(n_outer, 1)
-        outer_cdi = self.run(val_date, rates, spread_map, outer_cr)
+            asset_cfs = np.zeros((N_all, T_inner))
+            asset_pvs = np.zeros((N_all, T_inner))
+            for c_start in range(0, n_inner, chunk_size):
+                c_end = min(c_start + chunk_size, n_inner)
+                n_c = c_end - c_start
+                N_c = n_c * n_outer
 
-        df1 = outer_cdi.cdi_sim
-        cash_outer    = df1["cash"].values
-        hgb_gap_outer = df1["hgb_gap"].values
-        cum_hgb_outer = df1["hgb_payment"].values
-        bund_outer    = df1["bund_comparator"].values
+                print(f"Processing {n_c} scenarios {c_start} to {c_end} of {n_inner}")
 
-        # Issuer ratings at t=1
-        year1_mask    = outer_cr.transitions.index.get_level_values("year") == 1
-        year1_ratings = outer_cr.transitions.loc[year1_mask].values
+                year1_ratings_rep = np.repeat(year1_ratings, n_c, axis=0)
+                # print(year1_ratings_rep.shape)
+                inner_sim_c = cr_model.run_matrix(N_c, n_years_inner, n_issuers, sector_map, year1_ratings_rep)
+                # Inner bond sim
+                inner_bond_sim_c = self.bonds.run_sim(inner_val_date, rates, spread_map, inner_sim_c)
 
-        outer_bond_ratings = outer_cdi.bond_sim.transitions[:, 0, :]
-        already_defaulted  = (outer_bond_ratings == DEFAULT_LABEL)
+                # Fix double-recovery for bonds already defaulted in the outer year
+                outer_bond_ratings = outer_cdi.bond_sim.transitions[:, 0, :]
+                already_defaulted = (outer_bond_ratings == DEFAULT_LABEL)
+                already_def_all = np.repeat(already_defaulted, n_c, axis=0)
+                inner_bond_sim_c.recovery_payments[:, 0, :] *= ~already_def_all
+                inner_bond_sim_c.total_cashflows = inner_bond_sim_c.received_cashflows + inner_bond_sim_c.recovery_payments
 
-        tm = cr_model.transition_matrix
-        initial_indices_all = np.array([
-            [tm.label_to_idx[r] for r in year1_ratings[s]]
-            for s in range(n_outer)
-        ])
+                # get cashflows and pvs for all scenarios
+                shape_c = (N_c, T_inner)
+                asset_cfs_c = allocate_bond_sim(inner_bond_sim_c, self.cdi_allocation, shape_c, "cashflows")
+                asset_pvs_c = allocate_bond_sim(inner_bond_sim_c, self.cdi_allocation, shape_c, "pvs")
 
-        # ── Factor-model coefficients (constant across chunks) ──
-        n_issuers    = len(cr_model.issuer_ids)
-        n_sectors    = cr_model.sector_map.nunique()
-        rho_s_i      = cr_model.rho_s[cr_model.sector_map]
-        inner_val_date = sched.dates[0]
+                asset_cfs[c_start*n_outer:c_end*n_outer, :] = asset_cfs_c
+                asset_pvs[c_start*n_outer:c_end*n_outer, :] = asset_pvs_c
 
-        sqrt_rho_e   = np.sqrt(cr_model.rho_e)
-        sqrt_rho_s_e = np.sqrt(rho_s_i - cr_model.rho_e)
-        sqrt_1_rho_s = np.sqrt(1 - rho_s_i)
+                del inner_bond_sim_c, inner_sim_c, year1_ratings_rep, already_def_all, already_defaulted
 
-        pv_hgb_cond  = np.empty(n_outer)
-        pv_perf_cond = np.empty(n_outer)
+            # Free up memory
+            del  year1_ratings, outer_cr, outer_bond_ratings
 
-        # Accumulate detailed results
-        all_results = []
+            # ── Inner Waterfall ──
+            # get results of outer sim to use as starting points for inner sim
+            df1 = outer_cdi.cdi_sim
+            cash_outer = df1["cash"].values
+            hgb_gap_outer = df1["hgb_gap"].values
+            cum_hgb_outer = df1["hgb_payment"].values
+            bund_outer = df1["bund_comparator"].values
+            assets_outer = df1["assets"].values
 
-        # ── Chunked inner simulation ──
-        for c_start in range(0, n_outer, chunk_size):
-            c_end = min(c_start + chunk_size, n_outer)
-            n_c   = c_end - c_start
-            N_c   = n_c * n_inner
+            cash_t = np.repeat(np.asarray(cash_outer.astype(float)), n_inner)
+            assets_t = np.repeat(np.asarray(assets_outer.astype(float)), n_inner)
+            hgb_gap_t = np.repeat(np.asarray(hgb_gap_outer.astype(float)), n_inner)
+            cum_hgb = np.repeat(np.asarray(cum_hgb_outer.astype(float)), n_inner)
+            bund_t = np.repeat(np.asarray(bund_outer.astype(float)), n_inner)
 
-            # Credit draws
-            E       = np.random.normal(size=(N_c, n_years_inner))
-            S       = np.random.normal(size=(N_c, n_years_inner, n_sectors))
-            I_noise = np.random.normal(size=(N_c, n_years_inner, n_issuers))
+            shape_all = (N_all, T_inner)
+            # Empty arrays to store results
+            hgb_arr = np.zeros(shape_all)
+            cash_arr = np.zeros(shape_all)
+            assets_arr = np.zeros(shape_all)
+            fee_arr = np.zeros(shape_all)
+            hgb_gap_arr = np.zeros(shape_all)
+            hgb_payment_arr = np.zeros(shape_all)
+            perf_payment_arr_c = np.zeros(shape_all)
+            additional_pay_arr = np.zeros(shape_all)
+            bund_comparator_arr = np.zeros(shape_all)
+            net_asset_ret_arr = np.zeros(shape_all)
+            perf_payment_arr = np.zeros(N_all)
 
-            X = (
-                sqrt_rho_e * E[:, :, np.newaxis]
-                + sqrt_rho_s_e[np.newaxis, np.newaxis, :] * S[:, :, cr_model.sector_map]
-                + sqrt_1_rho_s[np.newaxis, np.newaxis, :] * I_noise
-            )
-            pX = sp.stats.norm.cdf(X)
+            # year in which performance payment is made
+            perf_inner_t = cfg.performance_payment_year - 2
 
-            init_chunk      = np.repeat(initial_indices_all[c_start:c_end], n_inner, axis=0)
-            inner_trans_arr = tm.transitions_from_state(pX, init_chunk)
-
-            inner_trans_df = pd.DataFrame(
-                inner_trans_arr.reshape(N_c * (n_years_inner + 1), n_issuers),
-                index=pd.MultiIndex.from_product(
-                    [range(N_c), range(n_years_inner + 1)], names=["sim", "year"]
-                ),
-                columns=cr_model.issuer_ids,
-            )
-            inner_sim = SimulationResult(E, S, I_noise, X, pX, inner_trans_df, N_c, n_years_inner)
-
-            # Inner bond sim (CDI allocation only)
-            inner_bond_sim = self.bonds.run_sim(inner_val_date, rates, spread_map, inner_sim)
-
-            # Fix double-recovery for bonds already defaulted in the outer year
-            already_def_c = np.repeat(already_defaulted[c_start:c_end], n_inner, axis=0)
-            inner_bond_sim.recovery_payments[:, 0, :] *= ~already_def_c
-            inner_bond_sim.total_cashflows = inner_bond_sim.received_cashflows + inner_bond_sim.recovery_payments
-
-            shape_c   = (N_c, T_inner)
-            asset_cfs = allocate_bond_sim(inner_bond_sim, self.cdi_allocation, shape_c, "cashflows")
-            asset_pvs = allocate_bond_sim(inner_bond_sim, self.cdi_allocation, shape_c, "pvs")
-
-            del inner_bond_sim, inner_trans_arr, inner_trans_df, inner_sim
-            del E, S, I_noise, X, pX
-
-            # ── Inner waterfall ──
-            cash_t    = np.repeat(np.asarray(cash_outer[c_start:c_end].astype(float)),    n_inner)
-            hgb_gap_t = np.repeat(np.asarray(hgb_gap_outer[c_start:c_end].astype(float)), n_inner)
-            cum_hgb   = np.repeat(np.asarray(cum_hgb_outer[c_start:c_end].astype(float)), n_inner)
-            bund_t    = np.repeat(np.asarray(bund_outer[c_start:c_end].astype(float)), n_inner)
-
-            # Collect waterfall arrays for this chunk
-            hgb_arr              = np.zeros(shape_c)
-            cash_arr_c           = np.zeros(shape_c)
-            assets_arr_c         = np.zeros(shape_c)
-            fee_arr_c            = np.zeros(shape_c)
-            hgb_gap_arr_c        = np.zeros(shape_c)
-            hgb_payment_arr_c    = np.zeros(shape_c)
-            perf_payment_arr_c   = np.zeros(shape_c)
-            additional_pay_arr_c = np.zeros(shape_c)
-            bund_comparator_arr_c = np.zeros(shape_c)
-            net_asset_ret_c      = np.zeros(shape_c)
-            perf_payment_arr     = np.zeros(N_c)
-
+            # Run waterfall for each time step
             for t in range(T_inner):
-                orig_t = t + 1
-                prev_cash_t = cash_t.copy()
+                # Store previous assets for return calculation before updating
+                prev_assets_t = assets_t.copy()
 
+                # Calculate fee as a percentage of total asset value (cash + cdi cashflow + PV of remaining assets) before liability payments
                 fee_t = cfg.fee * (cash_t * (1 + inner_fwds[t]) + asset_pvs[:, t] + asset_cfs[:, t])
+
+                # Update cash and assets after receiving asset cashflows, paying liabilities, and fees
                 cash_t = cash_t * (1 + inner_fwds[t]) + asset_cfs[:, t] - inner_liab_cfs[t] - fee_t
+
+                # Update assets to reflect cash changes and remaining asset PVs
                 assets_t = cash_t + asset_pvs[:, t]
 
+                # Calculate HGB gap and payment as difference between meltdown liabilities and assets + buffer
                 hgb_gap_t = np.clip(inner_meltdown[t] - (assets_t + inner_asset_buffer[t]), 0.0, hgb_gap_t)
-                hgb_pay_t = np.clip(inner_next2[t] - assets_t, 0.0, hgb_gap_t - cum_hgb)
-                cash_t   += hgb_pay_t
-                assets_t += hgb_pay_t
-                cum_hgb  += hgb_pay_t
 
+                # Pay shortfall up to HGB gap if assets go below the next-2-year liabilities
+                hgb_pay_t = np.clip(inner_next2[t] - assets_t, 0.0, hgb_gap_t - cum_hgb)
+                cash_t += hgb_pay_t
+                assets_t += hgb_pay_t
+                cum_hgb += hgb_pay_t
+
+                # Additional payment from client at year 10 to bring GAAP funding level up to 100% or IFRS up to 110%, capped by asset buffer.
                 add_t = 0.0
-                if orig_t == cfg.additional_payment_year - 1:
+                if t == cfg.additional_payment_year - 2:
                     add_t = np.clip(
                         np.minimum(inner_liab_pv_gaap[t] - assets_t, 1.1 * inner_liab_pv_ifrs[t] - assets_t),
-                        0.0, inner_asset_buffer[t],
+                        0.0,
+                        inner_asset_buffer[t],
                     )
-                    cash_t   += add_t
+                    cash_t += add_t
                     assets_t += add_t
 
                 # Bund comparator evolution
@@ -1089,90 +1144,81 @@ class CDIMandate_Fox:
                 # Performance payment at terminal year
                 if t == perf_inner_t:
                     perf_payment_arr = np.clip(bund_t - assets_t, 0.0, cfg.performance_cap)
+                else:
+                    perf_payment_arr = np.zeros(N_all)
 
-                net_ret_t = (assets_t + inner_liab_cfs[t] - add_t) / prev_cash_t - 1.0
+                # Net asset return for analysis
+                net_ret_t = (assets_t + inner_liab_cfs[t] - add_t) / prev_assets_t - 1.0
 
                 # Store arrays
-                fee_arr_c[:, t]             = fee_t
-                cash_arr_c[:, t]            = cash_t
-                assets_arr_c[:, t]          = assets_t
-                hgb_gap_arr_c[:, t]         = hgb_gap_t
-                hgb_payment_arr_c[:, t]     = hgb_pay_t
-                perf_payment_arr_c[:, t]    = (perf_payment_arr if t == perf_inner_t else 0.0)
-                additional_pay_arr_c[:, t]  = add_t
-                bund_comparator_arr_c[:, t] = bund_t
-                net_asset_ret_c[:, t]       = net_ret_t
+                fee_arr[:, t] = fee_t
+                cash_arr[:, t] = cash_t
+                assets_arr[:, t] = assets_t
+                hgb_arr[:, t] = hgb_pay_t
+                hgb_gap_arr[:, t] = hgb_gap_t
+                hgb_payment_arr[:, t] = hgb_pay_t
+                perf_payment_arr_c[:, t] = perf_payment_arr
+                additional_pay_arr[:, t] = add_t
+                bund_comparator_arr[:, t] = bund_t
+                net_asset_ret_arr[:, t] = net_ret_t
 
-            # Aggregate performance payment PV for this chunk
-            if has_perf:
-                pv_perf_path = perf_payment_arr * inner_df[perf_inner_t]
-            else:
-                pv_perf_path = np.zeros(N_c)
-
+            # Discounted Performance Payment and HGB payment for all paths
+            pv_perf_path = perf_payment_arr * inner_df[perf_inner_t] if (0 <= perf_inner_t <= T_inner) else np.zeros(N_all)
             pv_hgb_path = (hgb_arr * inner_df[np.newaxis, :]).sum(axis=1)
+            pv_fee_path = (fee_arr * inner_df[np.newaxis, :]).sum(axis=1)
 
-            # Store outer scenario aggregates
-            pv_hgb_cond[c_start:c_end]  = pv_hgb_path.reshape(n_c, n_inner).mean(axis=1)
-            pv_perf_cond[c_start:c_end] = pv_perf_path.reshape(n_c, n_inner).mean(axis=1)
+            # Conditional distribution of HGB PV and performance payment PV
+            pv_hgb_cond = pv_hgb_path.reshape(n_outer, n_inner).mean(axis=1)
+            pv_perf_cond = pv_perf_path.reshape(n_outer, n_inner).mean(axis=1)
+            pv_fee_cond = pv_fee_path.reshape(n_outer, n_inner).mean(axis=1)
 
-            # Build detailed DataFrame for this chunk
-            tile = lambda x: np.tile(x, (N_c, 1))
-            chunk_results = {
-                "dt":                    tile(inner_dt),
-                "liab_cashflow":         tile(inner_liab_cfs),
-                "liab_pv_gaap":          tile(inner_liab_pv_gaap),
-                "liab_pv_ifrs":          tile(inner_liab_pv_ifrs),
-                "meltdown_liabilities":  tile(inner_meltdown),
-                "next_2_liabs":          tile(inner_next2),
-                "bund_fwds":             tile(inner_fwds),
-                "bund_yield":            tile(inner_yields),
-                "fee":                   fee_arr_c,
-                "cash":                  cash_arr_c,
-                "assets":                assets_arr_c,
-                "net_asset_return":      net_asset_ret_c,
-                "hgb_gap":               hgb_gap_arr_c,
-                "hgb_payment":           hgb_payment_arr_c,
-                "bund_comparator":       bund_comparator_arr_c,
-                "performance_payment":   perf_payment_arr_c,
-                "additional_payment":    additional_pay_arr_c,
+            # Build detailed DataFrame (all results, no chunking)
+            tile = lambda x: np.tile(x, (N_all, 1))
+            results = {
+                "dt": tile(inner_dt),
+                "liab_cashflow": tile(inner_liab_cfs),
+                "liab_pv_gaap": tile(inner_liab_pv_gaap),
+                "liab_pv_ifrs": tile(inner_liab_pv_ifrs),
+                "meltdown_liabilities": tile(inner_meltdown),
+                "next_2_liabs": tile(inner_next2),
+                "bund_fwds": tile(inner_fwds),
+                "bund_yield": tile(inner_yields),
+                'remaining_asset_pv': asset_pvs,
+                'asset_cashflow': asset_cfs,
+                "fee": fee_arr,
+                "cash": cash_arr,
+                "assets": assets_arr,
+                "net_asset_return": net_asset_ret_arr,
+                "hgb_gap": hgb_gap_arr,
+                "hgb_payment": hgb_payment_arr,
+                "bund_comparator": bund_comparator_arr,
+                "performance_payment": perf_payment_arr_c,
+                "additional_payment": additional_pay_arr,
             }
-            
-            # MultiIndex: (outer_sim, inner_sim, date)
-            outer_sims = np.repeat(np.arange(c_start, c_end), n_inner * T_inner)
-            inner_sims = np.tile(np.repeat(np.arange(n_inner), T_inner), n_c)
-            dates_tiled = np.tile(sched.dates[1:], N_c)
-            
+
+            # Create MultiIndex for DataFrame: (outer_sim, inner_sim, date)
+            outer_sims = np.repeat(np.arange(n_outer), n_inner * T_inner)
+            inner_sims = np.tile(np.repeat(np.arange(n_inner), T_inner), n_outer)
+            dates_tiled = np.tile(inner_dates, N_all)
             index = pd.MultiIndex.from_arrays(
                 [outer_sims, inner_sims, dates_tiled],
                 names=["outer_sim", "inner_sim", "date"]
             )
-            
-            chunk_df = pd.DataFrame(
-                {k: v.reshape(-1) for k, v in chunk_results.items()},
+
+            # Output dataframe
+            icaap_df = pd.DataFrame(
+                {k: v.reshape(-1) for k, v in results.items()},
                 index=index
             ).reset_index()
-            
-            all_results.append(chunk_df)
 
-        # Combine all chunks
-        icaap_df = pd.concat(all_results, ignore_index=True)
-        
-        icaap_df["funding_level_gaap"] = icaap_df["assets"] / icaap_df["liab_pv_gaap"]
-        icaap_df["funding_level_ifrs"] = icaap_df["assets"] / icaap_df["liab_pv_ifrs"]
-        icaap_df["net_bt_return"]      = icaap_df["bund_yield"] + cfg.cmbp_margin
+            # Additional calculated columns
+            icaap_df["funding_level_gaap"] = icaap_df["assets"] / icaap_df["liab_pv_gaap"]
+            icaap_df["funding_level_ifrs"] = icaap_df["assets"] / icaap_df["liab_pv_ifrs"]
+            icaap_df["net_bt_return"] = icaap_df["bund_yield"] + cfg.cmbp_margin
 
-        # ── Result ──
-        df_1y = float((1 + sched.yields[0]) ** (-sched.dt[0]))
-        pv0   = float(base_result.pv_total_obligations().mean())
-
-        icaap_summary = ICAAPResult(
-            pv_hgb_t1=pv_hgb_cond,
-            pv_perf_t1=pv_perf_cond,
-            pv0=pv0,
-            df_1y=df_1y,
-            n_outer=n_outer,
-            n_inner=n_inner,
-            icaap_df=icaap_df,
-        )
-
-        return icaap_summary
+            return ICAAPResult(
+                pv_hgb_t1=pv_hgb_cond,
+                pv_perf_t1=pv_perf_cond,
+                pv_fee_t1=pv_fee_cond,
+                icaap_df=icaap_df
+            )
